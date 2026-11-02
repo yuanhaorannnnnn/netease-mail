@@ -1,0 +1,11 @@
+{
+  "status": "release-candidate",
+  "files": {
+    "SKILL.md": "18332054eb8aaf5de2724b4f358968586648581feca93d7d4f7662d905e9365a",
+    "README.md": "cbba249f9826f252e17e0ebe9ed11403c25329e8bc36dd6707050f0cdc4af652",
+    "scripts/server.py": "0be4da895bedd8c6a71d94dfb3272717f081cefb9d7e8d3bf8808e6e3068d14c",
+    "scripts/configure.py": "cc55dcc4f1ce242973e152010e3f3b8f04ea605e6a5c6258eedff76c246c723d",
+    "scripts/test_server.py": "8821be7fbe78217636f9a8c5b49a82b55f295ba8b339d591b769281a373404fc",
+    "scripts/test_configure.py": "e8386973c6bef342c077c069f9961f2981de786aa633078c8f4ac6cd97878c67"
+  }
+}

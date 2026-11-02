@@ -1,0 +1,41 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "netease-mail",
+  "version": "0.1.0",
+  "description": "测试版网易个人邮箱本地 MCP：搜索、读信、附件、草稿与授权发送；移动邮件暂不可用。",
+  "extensions": {
+    "com.openai": {
+      "requires_local_executor": true,
+      "interface": {
+        "displayName": "NetEase Mail",
+        "shortDescription": "网易个人邮箱助手 · 测试版 · 移动邮件暂不可用",
+        "longDescription": "通过本机 IMAP/SMTP 搜索和阅读网易个人邮箱、处理附件与草稿，并按明确授权发送、回复或转发。依赖本机 Python 和系统密钥库；移动邮件暂不可用。",
+        "developerName": "yuanhaorannnnnn",
+        "category": "Productivity",
+        "capabilities": [
+          "Read",
+          "Write"
+        ],
+        "defaultPrompt": [
+          "列出我的网易邮箱文件夹。",
+          "在收件箱最近 1,000 封的窗口里查找主题含发票的邮件，说明扫描范围。",
+          "读取这封邮件，先不要修改或回复。"
+        ]
+      }
+    }
+  },
+  "author": {
+    "name": "yuanhaorannnnnn",
+    "url": "https://github.com/yuanhaorannnnnn"
+  },
+  "homepage": "https://github.com/yuanhaorannnnnn/netease-mail",
+  "repository": "https://github.com/yuanhaorannnnnn/netease-mail",
+  "license": "MIT",
+  "keywords": [
+    "netease",
+    "email",
+    "imap",
+    "smtp",
+    "local-mcp"
+  ]
+}
