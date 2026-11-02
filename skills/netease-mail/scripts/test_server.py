@@ -93,6 +93,181 @@ class WireImap(imaplib.IMAP4):
 
 
 class TestMail(unittest.TestCase):
+    def test_draft_roundtrip_preserves_server_added_top_level_received_values_and_order(self):
+        c = FakeImap(); saved = []; smtp = FakeSmtp()
+        received = (b'Received: from offline-client.example.org by draft-storage.example.org\r\n'
+                    b' with ESMTPSA id synthetic-first; Mon, 02 Nov 2026 12:00:00 +0000\r\n'
+                    b'rEcEiVeD: from prior-hop.example.org by offline-client.example.org\r\n'
+                    b' with ESMTP id synthetic-second; Mon, 02 Nov 2026 11:59:00 +0000\r\n')
+        c.append = lambda *args: saved.append(received + args[-1]) or ('OK', [b''])
+        with patch.object(server, 'account', return_value=('user@163.com', 'synthetic-code', ('imap.163.com', 'smtp.163.com'))), patch.object(server, 'connect', return_value=c), patch.object(server.smtplib, 'SMTP_SSL', return_value=smtp):
+            created = server.create_draft('Drafts', ['to@example.org'], 'server-added trace', 'reviewed body')
+            with patch.object(server, '_fetch', return_value=saved[0]):
+                preview = server.read_email('Drafts', ACCOUNT_PREFIX + 'RHJhZnRz:42:1')
+                c.uid = lambda *args: ('OK', [b'1 (UID 1 FLAGS (\\Draft))'])
+                sent = server.send_draft('Drafts', ACCOUNT_PREFIX + 'RHJhZnRz:42:1')
+        original = server._message(saved[0]); transmitted = server._message(smtp.payload)
+        self.assertEqual([str(value) for value in transmitted.get_all('Received')], [str(value) for value in original.get_all('Received')])
+        self.assertEqual([header for header in preview['headers'] if header['name'].lower() == 'received'], server._headers(original)[:2])
+        self.assertEqual(sent['status'], 'accepted'); self.assertEqual(sent['message_id'], created['message_id'])
+        self.assertEqual(smtp.recipients, ['to@example.org']); self.assertTrue(smtp.payload.isascii())
+
+    def test_draft_received_does_not_allow_other_private_or_nested_trace_headers(self):
+        for location in ('root_private', 'nested_received'):
+            with self.subTest(location=location):
+                msg = EmailMessage(); msg['From'] = 'user@163.com'; msg['To'] = 'to@example.org'
+                msg['Message-ID'] = '<trace-boundary@example.org>'; msg['Received'] = 'untrusted trace, not identity or authorization'
+                msg.set_content('reviewed body')
+                if location == 'root_private': msg['X-Private-Token'] = 'not-allowed'
+                else:
+                    msg.make_mixed(); msg.get_payload(0)['Received'] = 'not-allowed in MIME child'
+                c = FakeImap(); c.uid = lambda *args: ('OK', [b'1 (UID 1 FLAGS (\\Draft))'])
+                with patch.object(server, 'account', return_value=('user@163.com', 'synthetic-code', ('imap.163.com', 'smtp.163.com'))), patch.object(server, 'connect', return_value=c), patch.object(server, '_fetch', return_value=msg.as_bytes()), patch.object(server.smtplib, 'SMTP_SSL') as smtp:
+                    with self.assertRaisesRegex(ValueError, 'header.*allowlist'):
+                        server.send_draft('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1')
+                smtp.assert_not_called()
+
+    def test_find_by_message_id_returns_duplicate_exact_matches_in_explicit_folder(self):
+        target = '<Exact.ID@example.org>'
+        c = SearchImap({1: b'Message-ID: <Exact.ID@example.org>\r\n\r\n',
+                        2: b'Message-ID: <exact.id@example.org>\r\n\r\n',
+                        3: b'Message-ID:\r\n <Exact.ID@example.org>\r\n\r\n', 4: b'Subject: no ID\r\n\r\n'})
+        with patch.object(server, 'connect', return_value=c):
+            result = server.find_by_message_id('Sent', ' ' + target + ' ')
+        self.assertEqual([item['id'] for item in result['items']], [ACCOUNT_PREFIX + 'U2VudA:42:3', ACCOUNT_PREFIX + 'U2VudA:42:1'])
+        self.assertEqual(result['coverage']['validated_fields'], ['Message-ID'])
+        self.assertEqual(result['status'], 'window_complete'); self.assertEqual(result['uniqueness'], 'not_established')
+        self.assertFalse(result['automatic_retry_allowed']); self.assertEqual(result['rfc_message_id'], target)
+        self.assertTrue(all(call[2] is True for call in c.calls if call[0] == 'select'))
+        self.assertTrue(all('BODY.PEEK[HEADER.FIELDS' in call[2] for call in c.calls if call[0] == 'FETCH'))
+        tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
+        self.assertTrue(tools['find_by_message_id'].annotations.readOnlyHint)
+
+    def test_find_by_message_id_preserves_empty_pages_and_recent_1000_window(self):
+        c = SearchImap({uid: f'Message-ID: <{"target" if uid <= 2 else "other"}@example.org>\r\n\r\n'.encode() for uid in range(1, 1002)})
+        with patch.object(server, 'connect', return_value=c):
+            first = server.find_by_message_id('INBOX', '<target@example.org>', scan_limit=500)
+            self.assertEqual(first['items'], []); self.assertEqual(first['status'], 'in_progress'); self.assertTrue(first['next_cursor'])
+            final = server.find_by_message_id('INBOX', '<target@example.org>', scan_limit=500, cursor=first['next_cursor'])
+        self.assertEqual([item['id'] for item in final['items']], [ACCOUNT_PREFIX + 'SU5CT1g:42:2'])
+        self.assertEqual(final['coverage']['scanned_total'], 1000); self.assertEqual(final['coverage']['older_messages_excluded'], 1)
+        self.assertTrue(final['coverage']['complete']); self.assertIsNone(final['next_cursor'])
+        self.assertFalse(final['automatic_retry_allowed']); self.assertIn('zero matches never proves', final['lookup_note'])
+        self.assertFalse(any('1' in call[1].split(',') for call in c.calls if call[0] == 'FETCH'))
+
+    def test_find_by_message_id_failures_and_ambiguous_headers_remain_partial(self):
+        c = SearchImap({1: b'Message-ID: <target@example.org>\r\n\r\n',
+                        2: b'Message-ID: <target@example.org>\r\nMessage-ID: <other@example.org>\r\n\r\n',
+                        3: b'Message-ID: <bad id@example.org>\r\n\r\n'})
+        with patch.object(server, 'connect', return_value=c): result = server.find_by_message_id('Drafts', '<target@example.org>')
+        self.assertEqual(len(result['items']), 1); self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['coverage']['failed_total'], 2); self.assertFalse(result['coverage']['complete'])
+        c.fetch_error = True
+        with patch.object(server, 'connect', return_value=c): failed = server.find_by_message_id('Drafts', '<target@example.org>')
+        self.assertEqual(failed['items'], []); self.assertEqual(failed['status'], 'partial')
+        self.assertEqual(failed['coverage']['failed_total'], 3); self.assertFalse(failed['automatic_retry_allowed'])
+
+    def test_find_by_message_id_cursor_binds_id_folder_mode_and_authenticated_account(self):
+        c = SearchImap({1: b'Message-ID: <target@example.org>\r\n\r\n', 2: b'Subject: no ID\r\n\r\n'})
+        with patch.object(server, 'connect', return_value=c): first = server.find_by_message_id('INBOX', '<target@example.org>', scan_limit=1)
+        cursor = first['next_cursor']; self.assertTrue(cursor)
+        with patch.object(server, 'connect') as connect:
+            for operation in (lambda: server.find_by_message_id('INBOX', '<different@example.org>', cursor=cursor),
+                              lambda: server.find_by_message_id('Sent', '<target@example.org>', cursor=cursor),
+                              lambda: server.search_emails(cursor=cursor)):
+                with self.assertRaisesRegex(ValueError, 'another folder/query'): operation()
+            connect.assert_not_called()
+        other = SearchImap(c.messages); other._codex_account_address = 'other@163.com'
+        with patch.object(server, 'connect', return_value=other):
+            with self.assertRaisesRegex(ValueError, 'another authenticated account'):
+                server.find_by_message_id('INBOX', '<target@example.org>', cursor=cursor)
+        self.assertEqual(other.calls, [])
+
+    def test_find_by_message_id_rejects_invalid_id_before_connect_and_never_inferrs_absence(self):
+        with patch.object(server, 'connect') as connect:
+            for identifier in ('', 'not-an-id', '<one@example.org> <two@example.org>', '<bad id@example.org>', '<one@example.org>\r\nX-Private: hidden', '<' + 'x' * 999 + '@example.org>'):
+                with self.assertRaisesRegex(ValueError, 'Message-ID'): server.find_by_message_id('INBOX', identifier)
+            connect.assert_not_called()
+        with patch.object(server, 'connect', return_value=SearchImap({})):
+            result = server.find_by_message_id('INBOX', '<target@example.org>')
+        self.assertEqual(result['items'], []); self.assertTrue(result['coverage']['complete'])
+        self.assertFalse(result['automatic_retry_allowed']); self.assertIn('zero matches never proves APPEND/send did not occur', result['lookup_note'])
+
+    def test_send_draft_requires_one_complete_valid_message_id_before_smtp(self):
+        for headers in [b'', b'Message-ID: <one@example.org>\r\nMessage-ID: <two@example.org>\r\n',
+                        b'Message-ID: <one@example.org> <two@example.org>\r\n', b'Message-ID: <bad id@example.org>\r\n',
+                        b'Message-ID: without-brackets@example.org\r\n']:
+            with self.subTest(headers=headers):
+                raw = b'From: user@163.com\r\nTo: to@example.org\r\nSubject: imported\r\n' + headers + b'\r\nreviewed body'
+                c = FakeImap(); c.uid = lambda *args: ('OK', [b'1 (UID 1 FLAGS (\\Draft))'])
+                with patch.object(server, 'connect', return_value=c), patch.object(server, '_fetch', return_value=raw), patch.object(server, 'account', return_value=('user@163.com', 'synthetic-code', ('imap.163.com', 'smtp.163.com'))), patch.object(server.smtplib, 'SMTP_SSL') as smtp:
+                    with self.assertRaisesRegex(ValueError, 'Message-ID.*update_draft'):
+                        server.send_draft('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1')
+                smtp.assert_not_called()
+
+    def test_send_and_update_draft_require_single_unambiguous_matching_from(self):
+        for headers in [b'From: user@163.com, other@example.org\r\n', b'From: user@163.com\r\nFrom: other@example.org\r\n',
+                        b'From: group:user@163.com;\r\n', b'From: user@163.com trailing-token\r\n', b'From:\r\n']:
+            for operation in ('send', 'update'):
+                with self.subTest(headers=headers, operation=operation):
+                    raw = headers + b'To: to@example.org\r\nMessage-ID: <imported@example.org>\r\nSubject: imported\r\n\r\nreviewed body'
+                    c = FakeImap(); c.uid = lambda *args: ('OK', [b'1 (UID 1 FLAGS (\\Draft))'])
+                    with patch.object(server, 'connect', return_value=c), patch.object(server, '_fetch', return_value=raw), patch.object(server, 'account', return_value=('user@163.com', 'synthetic-code', ('imap.163.com', 'smtp.163.com'))), patch.object(c, 'append', create=True) as append, patch.object(server.smtplib, 'SMTP_SSL') as smtp:
+                        with self.assertRaisesRegex(ValueError, 'single unambiguous.*From|From.*single unambiguous'):
+                            if operation == 'send': server.send_draft('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1')
+                            else: server.update_draft('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1', subject='new')
+                    smtp.assert_not_called(); append.assert_not_called()
+
+    def test_draft_send_rejects_root_or_nested_multipart_attachment_container(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                container = EmailMessage(); container.set_content('HIDDEN BODY'); container.make_mixed(); container['Content-Disposition'] = 'attachment'
+                if nested:
+                    msg = EmailMessage(); msg.make_mixed(); msg.attach(container)
+                else:
+                    msg = container
+                msg['From'] = 'user@163.com'; msg['To'] = 'to@example.org'
+                c = FakeImap(); c.uid = lambda *args: ('OK', [b'1 (UID 1 FLAGS (\\Draft))'])
+                with patch.object(server, 'connect', return_value=c), patch.object(server, '_fetch', return_value=msg.as_bytes()), patch.object(server, 'account', return_value=('user@163.com', 'synthetic-code', ('imap.163.com', 'smtp.163.com'))), patch.object(server.smtplib, 'SMTP_SSL') as smtp:
+                    preview = server.read_email('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1')
+                    self.assertEqual(preview['body'], ''); self.assertEqual(preview['attachments'], [])
+                    with self.assertRaisesRegex(ValueError, 'Multipart attachment containers'):
+                        server.send_draft('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1')
+                smtp.assert_not_called()
+
+    def test_draft_send_rejects_body_selected_differently_from_its_preview(self):
+        msg = EmailMessage(); msg['From'] = 'user@163.com'; msg['To'] = 'to@example.org'; msg.make_mixed()
+        inline = EmailMessage(); inline.set_content('reviewed attachment text'); inline['Content-Disposition'] = 'inline; filename="notes.txt"'
+        hidden = EmailMessage(); hidden.set_content('UNREVIEWED BODY'); msg.attach(inline); msg.attach(hidden)
+        c = FakeImap(); c.uid = lambda *args: ('OK', [b'1 (UID 1 FLAGS (\\Draft))'])
+        with patch.object(server, 'connect', return_value=c), patch.object(server, '_fetch', return_value=msg.as_bytes()), patch.object(server, 'account', return_value=('user@163.com', 'synthetic-code', ('imap.163.com', 'smtp.163.com'))), patch.object(server.smtplib, 'SMTP_SSL') as smtp:
+            preview = server.read_email('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1')
+            self.assertIn('reviewed attachment text', preview['body']); self.assertNotIn('UNREVIEWED BODY', preview['body'])
+            with self.assertRaisesRegex(ValueError, 'preview.*body|body.*preview'):
+                server.send_draft('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1')
+        smtp.assert_not_called()
+
+    def test_smtp_cleanup_failures_never_mask_any_send_result(self):
+        cases = [({}, 'accepted'), ({'rejected@example.org': (550, b'no')}, 'partially_accepted'),
+                 (server.smtplib.SMTPRecipientsRefused({'to@example.org': (550, b'no')}), 'refused'),
+                 (server.smtplib.SMTPSenderRefused(550, b'no', 'user@163.com'), 'refused'),
+                 (server.smtplib.SMTPDataError(554, b'no'), 'refused'), (TimeoutError('lost DATA response'), 'uncertain')]
+        for outcome, status in cases:
+            with self.subTest(status=status, outcome=type(outcome).__name__):
+                smtp = FakeSmtp()
+                with patch.object(server, 'account', return_value=('user@163.com', 'synthetic-code', ('imap.163.com', 'smtp.163.com'))), patch.object(server.smtplib, 'SMTP_SSL', return_value=smtp), patch.object(smtp, 'quit', side_effect=TimeoutError), patch.object(smtp, 'close', create=True, side_effect=OSError('cleanup failed')), patch.object(smtp, 'sendmail', **({'side_effect': outcome} if isinstance(outcome, Exception) else {'return_value': outcome})) as send:
+                    result = server.send_email(['to@example.org', 'rejected@example.org'], 'subject', 'body')
+                self.assertEqual(result['status'], status); self.assertEqual(send.call_count, 1)
+                if status == 'partially_accepted':
+                    self.assertEqual(result['accepted'], ['to@example.org']); self.assertEqual(result['refused'], ['rejected@example.org'])
+
+    def test_smtp_cleanup_does_not_mask_failure_before_sending(self):
+        smtp = FakeSmtp()
+        with patch.object(server, 'account', return_value=('user@163.com', 'synthetic-code', ('imap.163.com', 'smtp.163.com'))), patch.object(server.smtplib, 'SMTP_SSL', return_value=smtp), patch.object(smtp, 'login', side_effect=OSError('authentication unavailable')), patch.object(smtp, 'quit', side_effect=TimeoutError), patch.object(smtp, 'close', create=True, side_effect=OSError('cleanup failed')), patch.object(smtp, 'sendmail') as send:
+            with self.assertRaisesRegex(ValueError, 'before sending'):
+                server.send_email(['to@example.org'], 'subject', 'body')
+        send.assert_not_called()
+
     def test_move_without_move_capability_fails_closed_before_any_uid_command_or_expunge(self):
         for capabilities in [('IMAP4REV1', 'UIDPLUS'), ('IMAP4REV1',), ()]:
             with self.subTest(capabilities=capabilities):
@@ -156,6 +331,7 @@ class TestMail(unittest.TestCase):
 
     def test_draft_send_preserves_normal_charset_boundary_name_and_rfc2231_filename(self):
         msg = EmailMessage(policy=policy.SMTP); msg['From'] = 'user@163.com'; msg['To'] = 'to@example.org'; msg.set_content('普通正文')
+        msg['Message-ID'] = '<normal-attachment-draft@example.org>'
         msg.add_attachment(b'\x00\xffdata', maintype='application', subtype='octet-stream', filename='证据.bin')
         list(msg.iter_attachments())[0].set_param('name', '证据.bin')
         raw = msg.as_bytes(); c = FakeImap(); c.uid = lambda *args: ('OK', [b'1 (UID 1 FLAGS (\\Draft))']); smtp = FakeSmtp()
@@ -289,6 +465,7 @@ class TestMail(unittest.TestCase):
 
     def test_draft_send_keeps_plain_text_and_explicit_attachment_support(self):
         msg = EmailMessage(); msg['From'] = 'user@163.com'; msg['To'] = 'to@example.org'; msg.set_content('reviewed body')
+        msg['Message-ID'] = '<reviewed-attachment-draft@example.org>'
         msg.add_attachment(b'\x00\xffdata', maintype='application', subtype='octet-stream', filename='proof.bin')
         c = FakeImap(); c.uid = lambda *args: ('OK', [b'1 (UID 1 FLAGS (\\Draft))']); smtp = FakeSmtp()
         with patch.object(server, 'connect', return_value=c), patch.object(server, '_fetch', return_value=msg.as_bytes()), patch.object(server, 'account', return_value=('user@163.com', 'secret', ('imap.163.com', 'smtp.163.com'))), patch.object(server.smtplib, 'SMTP_SSL', return_value=smtp):
@@ -505,7 +682,7 @@ class TestMail(unittest.TestCase):
              ['one@example.org', 'two@example.org', 'three@example.org', 'four@example.org', 'hidden@example.org', 'other@example.org'])]
         for headers, expected in combinations:
             with self.subTest(headers=headers):
-                raw = b'From: user@163.com\r\n' + headers + b'Subject: draft\r\n\r\nbody'
+                raw = b'From: user@163.com\r\n' + headers + b'Subject: draft\r\nMessage-ID: <recipient-matrix@example.org>\r\n\r\nbody'
                 c = FakeImap(); smtp = FakeSmtp()
                 with patch.object(server, 'connect', return_value=c), patch.object(server, '_fetch', return_value=raw), patch.object(server, 'account', return_value=('user@163.com', 'secret', ('imap.163.com', 'smtp.163.com'))), patch.object(server.smtplib, 'SMTP_SSL', return_value=smtp):
                     preview = server.read_email('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1')
@@ -531,7 +708,7 @@ class TestMail(unittest.TestCase):
     def test_draft_preview_contains_all_recipient_headers_used_by_smtp(self):
         raw = (b'From: user@163.com\r\nTo: one@example.org\r\nTo: two@example.org\r\n'
                b'Cc: three@example.org\r\nCc: four@example.org\r\n'
-               b'Bcc: five@example.org\r\nBcc: six@example.org\r\nSubject: draft\r\n\r\nbody')
+               b'Bcc: five@example.org\r\nBcc: six@example.org\r\nSubject: draft\r\nMessage-ID: <duplicate-recipient-headers@example.org>\r\n\r\nbody')
         c = FakeImap()
         smtp = FakeSmtp()
         with patch.object(server, 'connect', return_value=c), patch.object(server, '_fetch', return_value=raw), patch.object(server, 'account', return_value=('user@163.com', 'secret', ('imap.163.com', 'smtp.163.com'))), patch.object(server.smtplib, 'SMTP_SSL', return_value=smtp):

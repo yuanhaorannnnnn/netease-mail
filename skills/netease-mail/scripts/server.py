@@ -9,7 +9,7 @@ import hmac
 from email import encoders, policy
 from email.header import decode_header, make_header
 from email.message import EmailMessage
-from email.utils import getaddresses, make_msgid, formatdate, parseaddr
+from email.utils import getaddresses, make_msgid, formatdate
 import imaplib
 import json
 import os
@@ -181,17 +181,24 @@ def _message(raw):
     return email.message_from_bytes(raw, policy=policy.default)
 
 
-def _message_id(msg):
-    header = msg.get('Message-ID', '')
-    value = str(header)
-    raw_values = [str(raw) for name, raw in msg.raw_items() if name.lower() == 'message-id']
-    if len(raw_values) != 1 or getattr(header, 'defects', ()): return value
+def _canonical_message_id(value):
     atom = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
     dot_atom = atom + r'(?:\.' + atom + r')*'
     fws = r'(?:[ \t]|\r\n[ \t]+)*'
     # Validate the complete raw field: headerregistry may hide trailing malformed tokens.
-    match = re.fullmatch(fws + r'(<' + dot_atom + r'@(?:' + dot_atom + r'|\[[\x21-\x5a\x5e-\x7e]*\])>)' + fws, raw_values[0])
-    return match.group(1) if match else value
+    match = re.fullmatch(fws + r'(<' + dot_atom + r'@(?:' + dot_atom + r'|\[[\x21-\x5a\x5e-\x7e]*\])>)' + fws, value)
+    return match.group(1) if match else None
+
+
+def _valid_message_id(msg):
+    header = msg.get('Message-ID', '')
+    raw_values = [str(raw) for name, raw in msg.raw_items() if name.lower() == 'message-id']
+    if len(raw_values) != 1 or getattr(header, 'defects', ()): return None
+    return _canonical_message_id(raw_values[0])
+
+
+def _message_id(msg):
+    return _valid_message_id(msg) or str(msg.get('Message-ID', ''))
 
 
 def _recipient_headers(msg):
@@ -207,8 +214,12 @@ def _summary(msg, identifier):
     return {'id': identifier, 'subject': _decoded(msg.get('Subject')), 'from': _decoded(msg.get('From')), **recipients, 'date': str(msg.get('Date', '')), 'message_id': _message_id(msg)}
 
 
+def _body_part(msg):
+    return msg.get_body(preferencelist=('plain', 'html')) if msg.is_multipart() else msg
+
+
 def _body(msg):
-    preferred = msg.get_body(preferencelist=('plain', 'html')) if msg.is_multipart() else msg
+    preferred = _body_part(msg)
     if preferred is None: return '', ''
     if preferred.get_content_disposition() == 'attachment': return '', ''
     try: text = preferred.get_content()
@@ -418,6 +429,10 @@ def _search_internal_day(metadata):
 @mcp.tool(annotations=READ)
 def search_emails(folder: str = 'INBOX', sender: str = '', subject: str = '', text: str = '', since: str = '', unread_only: bool = False, limit: int = 20, before_uid: int = 0, scan_limit: int = 200, cursor: str = '') -> dict:
     """Search only the selected folder's initial latest 1000 messages by UID, using locally decoded From/Subject. UID SEARCH ALL enumerates IDs for count verification; at most 1000 candidates' headers are fetched. Older messages, bodies and attachments are outside scope; nonempty text raises an error. Only queried headers are strictly validated; other summary fields are best effort. since (YYYY-MM-DD) uses INTERNALDATE; unread uses fetched FLAGS. Each page processes at most scan_limit (1–500) candidates and returns at most limit (1–50) hits. Follow next_cursor with the same query even after an empty page. Cursor freezes the initial window without backfilling older mail, binds account/folder/UIDVALIDITY/query and expires on process restart. Changes or failures prevent window completeness. status=window_complete and coverage.complete apply only to this initial recent-header window, never the whole mailbox. before_uid only narrows this window; cursor is required for cumulative coverage."""
+    return _search_window(folder, sender, subject, text, since, unread_only, limit, before_uid, scan_limit, cursor)
+
+
+def _search_window(folder='INBOX', sender='', subject='', text='', since='', unread_only=False, limit=20, before_uid=0, scan_limit=200, cursor='', rfc_message_id=''):
     if not 1 <= limit <= 50 or before_uid < 0 or not 1 <= scan_limit <= 500:
         raise ValueError('limit must be 1–50, scan_limit 1–500 and before_uid nonnegative.')
     if text: raise ValueError('TEXT/body/attachment search is unsupported; only decoded sender and subject headers are covered.')
@@ -429,7 +444,7 @@ def search_emails(folder: str = 'INBOX', sender: str = '', subject: str = '', te
     if since:
         try: day = datetime.date.fromisoformat(since)
         except ValueError: raise ValueError('since must be YYYY-MM-DD.') from None
-    query = {'sender': _search_normalize(sender), 'subject': _search_normalize(subject), 'since': since, 'unread_only': unread_only}
+    query = {'sender': _search_normalize(sender), 'subject': _search_normalize(subject), 'since': since, 'unread_only': unread_only, 'rfc_message_id': rfc_message_id}
     state = _search_resume(cursor) if cursor else None
     if state and (state['folder'] != folder or state['query'] != query or (before_uid and before_uid != state['before_uid'])):
         raise ValueError('Search cursor belongs to another folder/query/before_uid; restart the search.')
@@ -481,10 +496,15 @@ def search_emails(folder: str = 'INBOX', sender: str = '', subject: str = '', te
                     if msg.defects: raise ValueError('Malformed header block.')
                     from_text = _search_header_text(msg, 'From', candidate_warnings) if query['sender'] else ''
                     subject_text = _search_header_text(msg, 'Subject', candidate_warnings) if query['subject'] else ''
+                    candidate_id = _valid_message_id(msg) if rfc_message_id else None
+                    if rfc_message_id and msg.get_all('Message-ID') and candidate_id is None:
+                        error = 'Message-ID is malformed or ambiguous.'
+                        raise ValueError(error)
                     flags = re.search(rb'\bFLAGS\s*\(([^)]*)\)', metadata, re.I)
                     if unread_only and not flags: raise ValueError('Missing FLAGS; unread status unknown.')
                     internal_day = _search_internal_day(metadata) if day else None
                     matches = (query['sender'] in from_text and query['subject'] in subject_text and
+                               (not rfc_message_id or candidate_id == rfc_message_id) and
                                (not day or internal_day >= day) and
                                (not unread_only or not re.search(rb'(?:^|\s)\\Seen(?:\s|$)', flags.group(1), re.I)))
                     if matches: items.append(_summary(msg, _identifier(folder, validity, str(uid), client)))
@@ -510,7 +530,7 @@ def search_emails(folder: str = 'INBOX', sender: str = '', subject: str = '', te
         remaining = sum(1 for uid in final_bounded if not state['last'] or uid < state['last'])
         exhausted = remaining == 0
         complete = exhausted and not (state['failed'] or state['skipped'] or state['membership_changed'] or state['new_messages_seen'] or state['enumeration_unverified'])
-        validated_fields = [name for name, term in (('From', query['sender']), ('Subject', query['subject'])) if term]
+        validated_fields = [name for name, term in (('From', query['sender']), ('Subject', query['subject']), ('Message-ID', rfc_message_id)) if term]
         coverage = {'scope': 'initial latest at most 1000 messages in this folder, narrowed by before_uid; queried headers only; older messages, bodies and attachments not covered',
                     'complete_scope': 'initial_recent_1000_header_window_only',
                     'candidate_cap': 1000, 'older_messages_excluded': state['older_excluded'],
@@ -536,6 +556,18 @@ def search_emails(folder: str = 'INBOX', sender: str = '', subject: str = '', te
                 'status': 'window_complete' if complete else 'partial' if (state['failed'] or state['skipped'] or state['membership_changed'] or state['new_messages_seen'] or state['enumeration_unverified']) else 'in_progress',
                 'coverage': coverage, 'failures': failures, 'skipped': skipped, 'encoding_warnings': encoding_warnings}
     finally: _logout(client)
+
+
+@mcp.tool(annotations=READ)
+def find_by_message_id(folder: str, rfc_message_id: str, limit: int = 20, scan_limit: int = 200, cursor: str = '') -> dict:
+    """Locate all exact RFC Message-ID matches in one explicit folder's initial latest at most 1000-message header window. Continue next_cursor even after an empty page. Duplicate matches, failures and window-only coverage are preserved. Zero matches never proves an APPEND/send did not occur; matches do not prove delivery. Never authorize automatic retry/resend. Draft callers must separately check Draft flags."""
+    if not rfc_message_id or len(rfc_message_id) > 998 or any(char in rfc_message_id for char in '\r\n\x00'):
+        raise ValueError('Supply one complete supported RFC Message-ID without control characters.')
+    identifier = _canonical_message_id(rfc_message_id)
+    if identifier is None: raise ValueError('Supply one complete supported RFC Message-ID.')
+    result = _search_window(folder=folder, limit=limit, scan_limit=scan_limit, cursor=cursor, rfc_message_id=identifier)
+    return {**result, 'rfc_message_id': identifier, 'uniqueness': 'not_established', 'automatic_retry_allowed': False,
+            'lookup_note': 'Only this folder and initial recent-1000 header window were checked. Multiple stored messages can share Message-ID. A match does not prove recipient delivery; zero matches never proves APPEND/send did not occur. Do not resend automatically.'}
 
 
 @mcp.tool(annotations=READ)
@@ -621,6 +653,18 @@ def _addresses(values, required=False):
     if (required and not result) or len(result) != len(parsed) or any(not re.fullmatch(r'[^\s@<>]+@[^\s@<>]+', addr) for addr in result):
         raise ValueError('Invalid or missing recipient address.')
     return result
+
+
+def _check_draft_from(msg, sender):
+    values = msg.get_all('From', [])
+    try:
+        valid = (len(values) == 1 and not values[0].defects and len(values[0].addresses) == 1 and
+                 not any(group.display_name is not None for group in values[0].groups) and
+                 values[0].addresses[0].addr_spec.lower() == sender.lower())
+    except (AttributeError, ValueError):
+        valid = False
+    if not valid:
+        raise ValueError('Draft From must be a single unambiguous mailbox matching the authenticated account; nothing was changed or sent.')
 
 
 def _compose(to: list[str], subject: str, body: str, cc: list[str], bcc: list[str], attachment_paths: list[str], in_reply_to: str = '', references: str = '', expected_account: str = ''):
@@ -710,7 +754,9 @@ def _send(msg, sender, recipients):
     finally:
         if smtp:
             try: smtp.quit()
-            except Exception: smtp.close()
+            except Exception:
+                try: smtp.close()
+                except Exception: pass
 
 
 @mcp.tool(annotations=WRITE)
@@ -724,9 +770,9 @@ def create_draft(folder: str, to: list[str], subject: str, body: str, cc: list[s
         try:
             status, _ = client.append(_folder(folder), '(\\Draft)', imaplib.Time2Internaldate(datetime.datetime.now().astimezone()), msg.as_bytes(policy=policy.SMTP))
         except Exception:
-            return {'status': 'uncertain', 'folder': folder, 'message_id': _message_id(msg), 'note': 'Search for this Message-ID before retrying; append may have succeeded.'}
+            return {'status': 'uncertain', 'folder': folder, 'message_id': _message_id(msg), 'note': 'APPEND may have succeeded. Verify actual state before retrying; use find_by_message_id in this folder and continue all cursor pages. Its bounded zero-match result cannot prove non-creation. Do not append or send again automatically.'}
         if status != 'OK': raise ValueError('IMAP draft append was rejected.')
-        return {'status': 'created', 'folder': folder, 'message_id': _message_id(msg), 'note': 'Search this folder for the draft; APPENDUID is not assumed.'}
+        return {'status': 'created', 'folder': folder, 'message_id': _message_id(msg), 'note': 'Use find_by_message_id in this folder to locate candidates, then verify Draft flags; APPENDUID and unique matches are not assumed.'}
     finally: _logout(client)
 
 
@@ -761,8 +807,7 @@ def update_draft(folder: str, message_id: str, subject: str | None = None, body:
         if not _verified_draft(client, uid):
             raise ValueError('Original message is not a verified draft; nothing was changed.')
         msg = _message(_fetch(client, uid))
-        if parseaddr(msg.get('From', ''))[1].lower() != sender.lower():
-            raise ValueError('Draft From does not match configured account; nothing was changed.')
+        _check_draft_from(msg, sender)
         if any(name.lower().startswith('resent-') for name in msg.keys()):
             raise ValueError('Resent headers are unsupported; nothing was changed.')
         if body is not None and (msg.is_multipart() or msg.get_content_type() != 'text/plain' or msg.get_content_disposition() == 'attachment'):
@@ -780,10 +825,10 @@ def update_draft(folder: str, message_id: str, subject: str | None = None, body:
             status, _ = client.append(_folder(folder), '(\\Draft)', imaplib.Time2Internaldate(datetime.datetime.now().astimezone()), msg.as_bytes(policy=policy.SMTP))
         except Exception:
             return {'status': 'uncertain', 'original_retained': True, 'original_id': message_id,
-                    'replacement_message_id': _message_id(msg), 'note': 'Search for the replacement Message-ID before retrying; append may have succeeded.'}
+                    'replacement_message_id': _message_id(msg), 'note': 'Replacement APPEND may have succeeded. Use find_by_message_id in this folder and continue cursor pages; zero matches cannot prove non-creation. Do not append or send again automatically.'}
         if status != 'OK': raise ValueError('Replacement draft was rejected; original remains unchanged.')
         return {'status': 'created_replacement', 'original_retained': True, 'original_id': message_id,
-                'replacement_message_id': _message_id(msg), 'note': 'Both drafts remain. Search the folder for the replacement.'}
+                'replacement_message_id': _message_id(msg), 'note': 'Both drafts remain. Use find_by_message_id in this folder for replacement candidates and verify Draft flags; matches may be non-unique.'}
     finally: _logout(client)
 
 
@@ -891,17 +936,18 @@ def send_draft(folder: str, message_id: str) -> dict:
     sender, _, _ = account()
     if sender.lower() != source_account.lower():
         raise ValueError('Authenticated account changed after reading the draft; nothing was sent.')
-    if parseaddr(msg.get('From', ''))[1].lower() != sender.lower():
-        raise ValueError('Draft From does not match the configured account.')
+    _check_draft_from(msg, sender)
     mime_headers = {'mime-version', 'content-type', 'content-transfer-encoding', 'content-disposition'}
-    message_headers = {'from', 'to', 'cc', 'bcc', 'subject', 'date', 'message-id', 'in-reply-to', 'references'}
+    message_headers = {'received', 'from', 'to', 'cc', 'bcc', 'subject', 'date', 'message-id', 'in-reply-to', 'references'}
     for part in msg.walk():
         allowed = mime_headers | message_headers if part is msg else mime_headers
         counts = {}
         for name in part.keys():
             name = name.lower()
             counts[name] = counts.get(name, 0) + 1
-            if name not in allowed or (counts[name] > 1 and not (part is msg and name in ('to', 'cc', 'bcc'))):
+            if part is msg and name == 'message-id' and counts[name] > 1:
+                raise ValueError('Draft needs one complete valid Message-ID; use update_draft to create a replacement, then preview it before sending.')
+            if name not in allowed or (counts[name] > 1 and not (part is msg and name in ('received', 'to', 'cc', 'bcc'))):
                 raise ValueError('Draft contains an unpreviewed or duplicate header outside the supported allowlist; nothing was sent.')
         for name, parameters in [('Content-Type', {'charset', 'boundary', 'name'}), ('Content-Disposition', {'filename'})]:
             header = part.get(name)
@@ -910,9 +956,11 @@ def send_draft(folder: str, message_id: str) -> dict:
                 raise ValueError('Draft contains unsupported or malformed MIME parameters; nothing was sent.')
     if any(part.is_multipart() and (part.preamble or part.epilogue) for part in msg.walk()):
         raise ValueError('Draft contains unpreviewed multipart preamble or epilogue; nothing was sent.')
-    bodies, pending = 0, [msg]
+    bodies, pending, body_part = 0, [msg], None
     while pending:
         part = pending.pop()
+        if part.get_content_maintype() == 'multipart' and part.get_content_disposition() == 'attachment':
+            raise ValueError('Multipart attachment containers cannot be completely previewed; nothing was sent.')
         if _is_attachment(part): continue
         if part.is_multipart():
             if part.get_content_type() != 'multipart/mixed':
@@ -926,14 +974,19 @@ def send_draft(folder: str, message_id: str) -> dict:
         except (ValueError, UnicodeError, LookupError):
             raise ValueError('Draft body cannot be completely previewed or is truncated; nothing was sent.') from None
         bodies += 1
+        body_part = part
     if bodies != 1:
         raise ValueError('Draft must have exactly one completely previewable plain-text body; nothing was sent.')
+    if _body_part(msg) is not body_part:
+        raise ValueError('Draft preview selects a different body from the supported send body; nothing was sent.')
     recipients = []
     for values in _recipient_headers(msg).values():
         for value in values:
             if getattr(value, 'defects', ()): raise ValueError('Malformed recipient address header; nothing was sent.')
             recipients.extend(_addresses([_decoded(value)], True))
     if not recipients: raise ValueError('Invalid or missing recipient address.')
+    if not _valid_message_id(msg):
+        raise ValueError('Draft needs one complete valid Message-ID; use update_draft to create a replacement, then preview it before sending.')
     result = _send(msg, sender, recipients)
     result['draft_retained'] = True
     return result

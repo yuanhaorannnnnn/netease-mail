@@ -4,7 +4,7 @@
 
 让 Codex 通过本机 IMAP/SMTP 处理网易 `163.com`、`126.com`、`yeah.net` 个人邮箱：搜索、读信、附件、草稿、发信、回复、转发和已读/星标。采用 bundled Skill + 本地 stdio MCP，不适用于 Gmail 或企业邮箱。
 
-**0.1.2 测试版。移动邮件暂不可用。** 实测网易账号不支持原生 MOVE，危险的移动降级已禁用；不提供删除或清空垃圾箱。现有单账号真实邮箱验证不能保证所有账号、系统或客户端兼容。
+**0.1.3 测试版。移动邮件暂不可用。** 实测网易账号不支持原生 MOVE，危险的移动降级已禁用；不提供删除或清空垃圾箱。现有单账号真实邮箱验证不能保证所有账号、系统或客户端兼容。
 
 ## 能力与限制
 
@@ -55,7 +55,7 @@ ln -s "$PWD/skills/netease-mail" "$HOME/.agents/skills/netease-mail"
 
 根 `plugin.json` 和 `mcp.json` 采用 portable Agent Plugins 格式。MCP 入口为 `sh ${PLUGIN_ROOT}/scripts/run-server.sh`，由宿主展开包根目录。通过支持本地插件的 repo/personal marketplace 安装时，仍需先显式运行上述依赖安装脚本，再新开会话。
 
-已在隔离容器中验证 Codex marketplace 安装与版本更新、缓存副本的 MCP 启动；个人 marketplace 迁移尚未验证，也未上架 OpenAI 公共插件目录。公开 GitHub 仓库、marketplace 安装和公共目录发布是三个不同步骤。参见 [官方插件包装文档](https://developers.openai.com/plugins/build/plugins)；local MCP 的公共目录提交资格见 [desktop-only 插件文档](https://developers.openai.com/plugins/deploy/desktop-only)。
+已在隔离容器中验证 Codex marketplace 安装与版本更新、缓存副本的 MCP 启动；个人 marketplace 已在本机配置；尚未上架 OpenAI 公共插件目录。公开 GitHub 仓库、marketplace 安装和公共目录发布是三个不同步骤。参见 [官方插件包装文档](https://developers.openai.com/plugins/build/plugins)；local MCP 的公共目录提交资格见 [desktop-only 插件文档](https://developers.openai.com/plugins/deploy/desktop-only)。
 
 ## 配置账号
 
@@ -86,7 +86,9 @@ sh scripts/run-python.sh skills/netease-mail/scripts/configure.py
 - “为这封邮件起草一封回复，先让我核对收件人和内容。”
 - “把这封复杂邮件作为 `.eml` 原信附件转发，先展示预览和披露范围。”
 
-发送、回复、转发必须有明确发送指令；查询、预览、安装和配置都不构成发送授权。写入标记或修改草稿也须有相应要求。SMTP 接受只表示服务器接受，不证明对方收到；结果未知时先核实，不能自动重发。草稿发送后仍保留，避免重复发送。
+`find_by_message_id` 可在指定文件夹最近最多 1,000 个 UID 的头部窗口内分批查找，出现多个结果须逐一核验。未命中、扫描不完整或头部读取失败都不能证明邮件未发送或不存在；不自动重发。草稿发送要求唯一、有效的 Message-ID 和与账号匹配的唯一 From，这不保证全邮箱 Message-ID 唯一。草稿保留的 Received 头可能披露路由和 IP，发送前须审阅。
+
+发送、回复、转发必须有明确发送指令；查询、预览、安装和配置都不构成发送授权。写入标记或修改草稿也须有相应要求。SMTP 接受只表示服务器接受，不证明对方收到；结果未知时先核实，不能自动重发。草稿发送后仍保留，手动复用前须确认是否已发送。
 
 使用 `sh scripts/doctor.sh` 检查依赖和系统密钥库类型，不读取凭据或连接邮箱；其成功不代表邮箱认证已验证。依赖安装失败不会切换到不完整的新环境；已有旧环境不会被删除。更新代码不会自动替换已有 MCP 进程。只重新加载自己使用的连接，不结束其他会话的服务；启动时磁盘 hash 也不是运行字节的严格证明。
 
@@ -100,7 +102,9 @@ sh scripts/run-python.sh skills/netease-mail/scripts/configure.py
 
 ## 验证范围
 
-2026-11-02：Linux/Python 3.11.7 干净 venv 安装通过，95 项离线回归通过；排除开发 `.venv` 后复制包到临时目录，stdio initialize、17 个工具发现、源码 hash 核对及隔离 HOME 的未配置账号拒绝通过。包装测试未访问真实邮箱。已另在隔离容器验证实际 Codex 缓存安装与版本更新；个人 marketplace 迁移尚未验证。依赖存在 `pydantic_settings` 的 lifespan forward-reference warning，未阻断测试。
+0.1.2 历史包装验证（2026-11-02）：Linux/Python 3.11.7 干净 venv 安装通过，95 项离线回归通过；排除开发 `.venv` 后复制包到临时目录，stdio initialize、17 个工具发现、源码 hash 核对及隔离 HOME 的未配置账号拒绝通过。包装测试未访问真实邮箱。已另在隔离容器验证实际 Codex 缓存安装与版本更新。依赖存在 `pydantic_settings` 的 lifespan forward-reference warning，未阻断测试。
+
+0.1.3 B 阶段：108 项邮件与配置离线测试及源码 stdio 握手（18 个工具）通过；本人草稿实测经 SMTP 接受，并在已发送与收件箱查到。收件箱 Message-ID 查找因部分其他邮件头读取失败而不完整，不能据此判断全邮箱唯一。草稿仍保留；没有跨进程自动防重保证。
 
 从仓库根目录运行无凭据测试：
 

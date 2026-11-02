@@ -1,6 +1,6 @@
 # 发布前检查
 
-当前状态：已导入发布候选基线；源码 hash 见 SOURCE-SNAPSHOT.json。干净运行环境安装、95 项离线回归、复制后 stdio 握手、17 个工具发现、来源 hash 核对及未配置账号错误边界通过。官方 plugin/MCP JSON schema 校验通过。后续在隔离容器中验证 Codex marketplace/cache 安装与版本更新；个人 marketplace 迁移尚未验证。下面是最终发布检查表，尚未逐项完成。
+当前源码 hash 见 SOURCE-SNAPSHOT.json。0.1.2 历史包装基线通过干净运行环境安装、95 项离线回归、复制后 stdio 握手和 17 个工具发现，并在隔离容器验证 marketplace/cache 更新。0.1.3 B 阶段通过 108 项邮件与配置测试及源码 stdio 握手（18 个工具）；个人 marketplace 已在本机配置。下面是发布检查表，平台和真实账号覆盖仍有限。
 
 1. 按照用户接受的范围验收 A/B/C（文件夹移动暂不支持），确认唯一源码版本、提交或文件 hash，冻结导入期间的修改；复制可发布源码及运行所需参考资料，排除账号、授权码、邮件样本、真实附件和运行日志。不得把开发目录符号链接作为公开包源码。
 2. 核对源码 License 与依赖许可证，补齐 LICENSE、作者、真实 repository URL、发行版本。确定支持的 Python 版本和依赖版本；明确 Linux/macOS/Windows 中实际验证过的平台及 keyring backend。
@@ -15,3 +15,5 @@
 2026-11-02 包装验证：Linux/Python 3.11.7，空 venv 安装固定直接依赖，85/85 离线回归通过。排除 .venv 后复制发行包至临时目录，以独立数据目录 venv 启动复制包：initialize、tools/list（17）、get_server_info hash 对照通过；隔离 HOME 且未配置账号时 list_folders 明确拒绝。未使用真实邮箱。依赖发出 pydantic_settings lifespan forward-reference warning，但握手及测试通过。实际 Codex 安装、目标桌面密钥库、其他系统与真实邮箱仍待验证。
 
 2026-11-02 A 阶段：隔离容器验证 Codex marketplace 安装、缓存源码 hash、版本切换；从缓存副本完成 17 工具的无凭据 stdio 握手。本机隔离数据目录完成全新 runtime 安装与自检。个人 marketplace 迁移和真实 Codex 插件卡片仍待验证。
+
+2026-11-02 B 阶段：108 项邮件与配置离线测试通过。本人草稿实际发送后在已发送和收件箱查到；收件箱按 Message-ID 查询有其他邮件头读取失败，结果为 partial，不代表全邮箱唯一。草稿保留，不支持跨进程自动防重。
