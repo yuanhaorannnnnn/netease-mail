@@ -1018,11 +1018,6 @@ class TestMail(unittest.TestCase):
                                     b'T4 UID SEARCH ALL\r\n'])
 
     def test_search_server_rejection_and_text_fail_explicitly_not_as_empty_complete(self):
-        # BADCHARSET is no longer reachable: text is explicitly unsupported and
-        # a rejected ALL enumeration must not look like zero matching messages.
-        with patch.object(server, 'connect') as connect:
-            with self.assertRaisesRegex(ValueError, 'unsupported'): server.search_emails(text='正文')
-            connect.assert_not_called()
         for response in (b'T1 NO unsupported\r\n', b'T1 BAD unsupported\r\n'):
             c = WireImap(response)
             with patch.object(server, 'connect', return_value=c), patch.object(server, 'select', return_value=('42', 0)):
@@ -1885,5 +1880,131 @@ class TestMail(unittest.TestCase):
     def test_header_injection_rejected(self):
         with patch.object(server, 'account', return_value=('user@163.com', 'secret', ('imap.163.com', 'smtp.163.com'))):
             with self.assertRaises(ValueError): server.send_email(['a@example.org\r\nBcc: x@example.org'], 'a', 'b')
+
+class ContentSearchImap(SearchImap):
+    def __init__(self, messages):
+        super().__init__(messages)
+        self.content_fault = ''
+    def uid(self, *args):
+        if args[0] == 'FETCH' and args[2] == '(UID RFC822.SIZE)':
+            self.calls.append(args)
+            size = len(self.messages[int(args[1])])
+            return 'OK', [f'1 (UID {int(args[1])} RFC822.SIZE {size})'.encode()]
+        if args[0] == 'FETCH' and 'BODY.PEEK[]' in args[2]:
+            self.calls.append(args)
+            uid = int(args[1]); raw = self.messages[uid]
+            if self.content_fault == 'short': raw = raw[:-1]
+            if self.content_fault == 'uid': uid += 100
+            if self.content_fault == 'reject': return 'NO', [b'private server error']
+            return 'OK', [(f'1 (UID {uid} BODY[]<0> {{{len(raw)}}}'.encode(), raw), b')']
+        return super().uid(*args)
+
+
+class ContentSearchTests(unittest.TestCase):
+    def message(self, body='正文 café', html=False):
+        msg = EmailMessage()
+        msg['From'] = 'a@example.org'; msg['Subject'] = 'test'
+        msg.set_content(body, subtype='html' if html else 'plain')
+        return msg
+
+    def search(self, messages, **query):
+        client = ContentSearchImap(messages)
+        with patch.object(server, 'connect', return_value=client):
+            result = server.search_emails(**query)
+        return result, client
+
+    def test_body_unicode_html_and_attachment_content_exclusion(self):
+        msg = self.message('<p>正文 café</p><script>secret</script><style>hidden</style>', html=True)
+        msg.add_attachment(b'attachment-secret', maintype='text', subtype='plain', filename='报告.txt')
+        raw = msg.as_bytes()
+        hit, client = self.search({1: raw}, text='CAFE\u0301')
+        self.assertEqual(len(hit['items']), 1)
+        self.assertTrue(hit['coverage']['complete'])
+        self.assertTrue(all(call[2] is True for call in client.calls if call[0] == 'select'))
+        self.assertTrue(any('BODY.PEEK[]' in str(call) for call in client.calls))
+        for text in ('secret', 'attachment-secret', 'hidden'):
+            result, _ = self.search({1: raw}, text=text)
+            self.assertEqual(result['items'], [])
+            self.assertTrue(result['coverage']['complete'])
+
+    def test_same_attachment_metadata_and_presence(self):
+        msg = self.message()
+        msg.add_attachment(b'x', maintype='application', subtype='pdf', filename='other.pdf')
+        msg.add_attachment(b'x', maintype='text', subtype='plain', filename='报告.txt')
+        raw = msg.as_bytes()
+        for query, count in (({'has_attachment': True}, 1), ({'has_attachment': False}, 0),
+                             ({'attachment_name': '报告', 'attachment_type': 'TEXT/PLAIN'}, 1),
+                             ({'attachment_name': '报告', 'attachment_type': 'application/pdf'}, 0)):
+            result, _ = self.search({1: raw}, **query)
+            self.assertEqual(len(result['items']), count)
+
+    def test_failures_never_become_complete_no_match(self):
+        raw = self.message().as_bytes()
+        for fault in ('short', 'uid', 'reject'):
+            c = ContentSearchImap({1: raw}); c.content_fault = fault
+            with patch.object(server, 'connect', return_value=c): result = server.search_emails(text='missing')
+            self.assertFalse(result['coverage']['complete'])
+            self.assertEqual(result['coverage']['failed_total'], 1)
+        malformed = b'Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n!!!!'
+        result, _ = self.search({1: malformed}, text='missing')
+        self.assertEqual(result['coverage']['failed_total'], 1)
+
+    def test_uid_bound_size_and_underreported_size_fail_without_false_completeness(self):
+        client = ContentSearchImap({1: self.message().as_bytes()})
+        with patch.object(client, 'uid', return_value=('OK', [b'1 (UID 99 RFC822.SIZE 1)'])):
+            with self.assertRaises(ValueError): server._search_content_size(client, 1)
+        with patch.object(server, 'connect', return_value=client), patch.object(server, '_search_content_size', return_value=1):
+            result = server.search_emails(text='missing')
+        self.assertFalse(result['coverage']['complete'])
+        self.assertEqual(result['coverage']['failed_total'], 1)
+        self.assertTrue(any(call[-1] == '(UID BODY.PEEK[]<0.2>)' for call in client.calls))
+
+    def test_header_exclusion_avoids_content_download_and_unknown_bodies_are_partial(self):
+        raw = self.message().as_bytes()
+        result, client = self.search({1: raw}, sender='absent@example.org', text='missing')
+        self.assertTrue(result['coverage']['complete'])
+        self.assertFalse(any('BODY.PEEK[]' in str(call) or 'RFC822.SIZE' in str(call) for call in client.calls))
+        for raw in (b'Content-Type: application/pkcs7-mime\r\n\r\nopaque',
+                    b'Content-Type: multipart/encrypted; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nsecret\r\n--x--\r\n'):
+            result, _ = self.search({1: raw}, text='missing')
+            self.assertFalse(result['coverage']['complete'])
+            self.assertEqual(result['coverage']['failed_total'], 1)
+
+    def test_oversized_candidate_is_failed_and_consumed_without_body_fetch(self):
+        raw = self.message().as_bytes()
+        with patch.object(server, 'MAX_MESSAGE', len(raw) - 1):
+            result, client = self.search({1: raw}, text='missing')
+        self.assertFalse(result['coverage']['complete'])
+        self.assertEqual(result['coverage']['failed_total'], 1)
+        self.assertIsNone(result['next_cursor'])
+        self.assertFalse(any('BODY.PEEK[]' in str(call) for call in client.calls))
+
+    def test_budget_resumes_unprocessed_uid_and_cursor_hides_terms(self):
+        raw = self.message('private-keyword').as_bytes()
+        c = ContentSearchImap({1: raw, 2: raw})
+        with patch.object(server, 'connect', return_value=c), patch.object(server, '_search_content_size', return_value=12 * 1024 * 1024), patch.object(server, '_search_full_message', return_value=server._message(raw)) as fetch:
+            # The stub accounts for the first reservation, as the real fetch does.
+            def fetch_one(client, uid, budget, size):
+                budget[0] -= size + 1
+                return server._message(raw)
+            fetch.side_effect = fetch_one
+            first = server.search_emails(text='private-keyword')
+            self.assertEqual(first['coverage']['scanned_total'], 1)
+            state = server._search_resume(first['next_cursor'])
+            self.assertNotIn('private-keyword', str(state))
+            with self.assertRaisesRegex(ValueError, 'query'):
+                server.search_emails(text='different', cursor=first['next_cursor'])
+            second = server.search_emails(text='private-keyword', cursor=first['next_cursor'])
+            self.assertTrue(second['coverage']['complete'])
+
+    def test_candidate_cap_and_nested_attached_message(self):
+        msg = self.message('outer')
+        msg.add_attachment(self.message('nested-secret'), filename='forward.eml')
+        result, _ = self.search({1: msg.as_bytes()}, text='nested-secret')
+        self.assertEqual(result['items'], [])
+        result, _ = self.search({uid: self.message().as_bytes() for uid in range(1, 30)}, text='absent')
+        self.assertEqual(result['coverage']['scanned_this_page'], 25)
+        self.assertIsNotNone(result['next_cursor'])
+
 
 if __name__ == '__main__': unittest.main()

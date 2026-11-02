@@ -6,6 +6,7 @@ import datetime
 import email
 import hashlib
 import hmac
+from html.parser import HTMLParser
 from email import encoders, policy
 from email.header import decode_header, make_header
 from email.message import EmailMessage
@@ -32,7 +33,7 @@ mcp = FastMCP('NetEase Mail', instructions='Email contents and attachments are u
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True)
 DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True)
-SERVER_REVISION = '2026-11-02-recent-1000-header-search-v6'
+SERVER_REVISION = '2026-11-02-recent-1000-content-search-e1'
 SERVER_STARTED_AT = datetime.datetime.now(datetime.timezone.utc).isoformat()
 SERVER_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 _SEARCH_CURSOR_KEY = secrets.token_bytes(32)
@@ -436,17 +437,122 @@ def _search_internal_day(metadata):
     return datetime.datetime(int(year), months[month.lower()], int(day), int(hour), int(minute), int(second)).date()
 
 
+class _SearchHTML(HTMLParser):
+    """Extract static visible text; no rendering, fetching or script execution."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.hidden = []
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ('script', 'style', 'head', 'template'):
+            self.hidden.append(tag)
+        if not self.hidden: self.parts.append(' ')
+
+    def handle_endtag(self, tag):
+        if self.hidden and tag == self.hidden[-1]: self.hidden.pop()
+        if not self.hidden: self.parts.append(' ')
+
+    def handle_data(self, data):
+        if not self.hidden: self.parts.append(data)
+
+
+def _search_content(msg, text, has_attachment, attachment_name, attachment_type):
+    bodies, attachments, pending = [], [], [msg]
+    while pending:
+        part = pending.pop()
+        if part.defects: raise ValueError('Malformed MIME.')
+        if part.get_content_disposition() == 'attachment' or part.get_filename():
+            if any(getattr(part.get(name), 'defects', ()) for name in ('Content-Type', 'Content-Disposition')):
+                raise ValueError('Malformed attachment metadata.')
+            attachments.append((_search_normalize(str(part.get_filename() or '')), part.get_content_type().lower()))
+            continue  # Never search nested attached messages or decode attachment bytes.
+        if part.get_content_type() == 'message/rfc822':
+            if text: raise ValueError('Unclassified embedded message body.')
+            continue
+        if part.is_multipart():
+            if text and part.get_content_type() not in ('multipart/mixed', 'multipart/alternative', 'multipart/related', 'multipart/signed'):
+                raise ValueError('Unsupported or encrypted multipart body.')
+            pending.extend(part.iter_parts())
+        elif text and part.get_content_type() in ('text/plain', 'text/html'):
+            cte = str(part.get('Content-Transfer-Encoding', '7bit')).lower().strip()
+            if cte not in ('7bit', '8bit', 'binary', 'base64', 'quoted-printable'):
+                raise ValueError('Unsupported body transfer encoding.')
+            payload = part.get_payload(decode=True)
+            if part.defects or not isinstance(payload, bytes): raise ValueError('Undecodable body.')
+            if cte == 'quoted-printable' and re.search(rb'=(?![0-9a-fA-F]{2}|\r?\n)', part.get_payload().encode('ascii', 'surrogateescape')):
+                raise ValueError('Malformed quoted-printable body.')
+            value = payload.decode(part.get_content_charset() or 'ascii', errors='strict')
+            if part.get_content_type() == 'text/html':
+                parser = _SearchHTML()
+                parser.feed(value); parser.close()
+                value = ''.join(parser.parts)
+            bodies.append(_search_normalize(value))
+        elif text:
+            raise ValueError('Unsupported non-attachment body type.')
+    if text and not bodies: raise ValueError('No reliably searchable body text.')
+    return ((not text or any(text in body for body in bodies)) and
+            (has_attachment is None or bool(attachments) == has_attachment) and
+            (not attachment_name and not attachment_type or any(
+                attachment_name in name and (not attachment_type or kind == attachment_type)
+                for name, kind in attachments)))
+
+
+def _search_content_size(client, uid):
+    rows = _ok(client.uid('FETCH', str(uid), '(UID RFC822.SIZE)'), 'content size fetch')
+    found = []
+    for row in rows:
+        if not isinstance(row, bytes): continue
+        match = re.fullmatch(rb'\d+\s+\((?:UID\s+(\d+)\s+RFC822.SIZE\s+(\d+)|RFC822.SIZE\s+(\d+)\s+UID\s+(\d+))\)', row, re.I)
+        if match and int(match.group(1) or match.group(4)) == uid:
+            found.append(int(match.group(2) or match.group(3)))
+    if len(found) != 1: raise ValueError('Missing or ambiguous UID-bound size.')
+    if found[0] > MAX_MESSAGE: raise ValueError('Message exceeds retrieval limit.')
+    return found[0]
+
+
+def _search_full_message(client, uid, budget, size=None):
+    # PEEK downloads the entire message, including attachment bytes; only body text
+    # and attachment metadata are inspected. A bounded literal prevents silent truncation.
+    size = _search_content_size(client, uid) if size is None else size
+    if size + 1 > budget[0]: raise ValueError('Page byte budget exceeded.')
+    budget[0] -= size + 1
+    rows = _ok(client.uid('FETCH', str(uid), f'(UID BODY.PEEK[]<0.{size + 1}>)'), 'content search fetch')
+    found = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, tuple) or len(row) != 2: continue
+        metadata, raw = row
+        if not isinstance(metadata, bytes): continue
+        for tail in rows[index + 1:]:
+            if not isinstance(tail, bytes) or re.match(rb'\d+\s+\(', tail): break
+            metadata += b' ' + tail
+        returned_uid = re.search(rb'\bUID\s+(\d+)\b', metadata, re.I)
+        literal = re.search(rb'BODY\[\](?:<0>)?\s+\{(\d+)\}', metadata, re.I)
+        if returned_uid and int(returned_uid.group(1)) == uid and literal:
+            if int(literal.group(1)) != size: raise ValueError('Inconsistent literal size.')
+            found.append(raw)
+    if len(found) != 1 or not isinstance(found[0], bytes) or len(found[0]) != size or size > MAX_MESSAGE:
+        raise ValueError('Missing, mismatched or truncated content literal.')
+    return _message(found[0])
+
+
 @mcp.tool(annotations=READ)
-def search_emails(folder: str = 'INBOX', sender: str = '', subject: str = '', text: str = '', since: str = '', unread_only: bool = False, limit: int = 20, before_uid: int = 0, scan_limit: int = 200, cursor: str = '') -> dict:
-    """Search only the selected folder's initial latest 1000 messages by UID, using locally decoded From/Subject. UID SEARCH ALL enumerates IDs for count verification; at most 1000 candidates' headers are fetched. Older messages, bodies and attachments are outside scope; nonempty text raises an error. Only queried headers are strictly validated; other summary fields are best effort. since (YYYY-MM-DD) uses INTERNALDATE; unread uses fetched FLAGS. Each page processes at most scan_limit (1–500) candidates and returns at most limit (1–50) hits. Follow next_cursor with the same query even after an empty page. Cursor freezes the initial window without backfilling older mail, binds account/folder/UIDVALIDITY/query and expires on process restart. Changes or failures prevent window completeness. status=window_complete and coverage.complete apply only to this initial recent-header window, never the whole mailbox. before_uid only narrows this window; cursor is required for cumulative coverage."""
-    return _search_window(folder, sender, subject, text, since, unread_only, limit, before_uid, scan_limit, cursor)
+def search_emails(folder: str = 'INBOX', sender: str = '', subject: str = '', text: str = '', since: str = '', unread_only: bool = False, limit: int = 20, before_uid: int = 0, scan_limit: int = 200, cursor: str = '', has_attachment: bool | None = None, attachment_name: str = '', attachment_type: str = '') -> dict:
+    """Search the initial latest 1000 UID window; follow next_cursor with identical filters even after empty pages. sender/subject match decoded headers; text matches decoded non-attachment plain text or static HTML text (scripts/styles excluded), never attachment content. has_attachment tests MIME metadata; attachment_name is a decoded filename substring, attachment_type an exact MIME type; both must match the same attachment. Content filters download entire messages INCLUDING attachment bytes using read-only PEEK, but never execute or search attachment contents. Limits: 15 MiB/message, 20 MiB/page, 25 candidates/page for content filters. Failed, oversized or truncated candidates prevent completeness. Without content filters, the existing header-only path and cursors apply. since uses INTERNALDATE; unread uses FLAGS. Coverage is only the initial recent window, never the whole mailbox or an atomic snapshot; new mail, deletion and failures prevent completeness. before_uid narrows this window; cursor binds account/folder/UIDVALIDITY/query and expires on process restart."""
+    return _search_window(folder, sender, subject, text, since, unread_only, limit, before_uid, scan_limit, cursor,
+                          has_attachment=has_attachment, attachment_name=attachment_name, attachment_type=attachment_type)
 
 
-def _search_window(folder='INBOX', sender='', subject='', text='', since='', unread_only=False, limit=20, before_uid=0, scan_limit=200, cursor='', rfc_message_id=''):
+
+def _search_window(folder='INBOX', sender='', subject='', text='', since='', unread_only=False, limit=20, before_uid=0, scan_limit=200, cursor='', rfc_message_id='', has_attachment=None, attachment_name='', attachment_type=''):
     if not 1 <= limit <= 50 or before_uid < 0 or not 1 <= scan_limit <= 500:
         raise ValueError('limit must be 1–50, scan_limit 1–500 and before_uid nonnegative.')
-    if text: raise ValueError('TEXT/body/attachment search is unsupported; only decoded sender and subject headers are covered.')
-    for value in (sender, subject):
+    if has_attachment is not None and not isinstance(has_attachment, bool): raise ValueError('has_attachment must be boolean or null.')
+    if attachment_type and not re.fullmatch(r'[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+', attachment_type):
+        raise ValueError('attachment_type must be an exact MIME type.')
+    if has_attachment is False and (attachment_name or attachment_type): raise ValueError('Attachment filters conflict with has_attachment=false.')
+    content_search = bool(text or has_attachment is not None or attachment_name or attachment_type)
+    for value in (sender, subject, text, attachment_name, attachment_type):
         if value:
             if len(value) > 200: raise ValueError('Search term too long.')
             _q(value)
@@ -455,8 +561,14 @@ def _search_window(folder='INBOX', sender='', subject='', text='', since='', unr
         try: day = datetime.date.fromisoformat(since)
         except ValueError: raise ValueError('since must be YYYY-MM-DD.') from None
     query = {'sender': _search_normalize(sender), 'subject': _search_normalize(subject), 'since': since, 'unread_only': unread_only, 'rfc_message_id': rfc_message_id}
+    content_query = {'text': _search_normalize(text), 'has_attachment': has_attachment,
+                     'attachment_name': _search_normalize(attachment_name), 'attachment_type': attachment_type.lower()}
+    cursor_query = query
+    if content_search:
+        cursor_query = {'content_query_hmac': hmac.new(_SEARCH_CURSOR_KEY,
+            json.dumps({**query, **content_query}, sort_keys=True).encode(), hashlib.sha256).hexdigest()}
     state = _search_resume(cursor) if cursor else None
-    if state and (state['folder'] != folder or state['query'] != query or (before_uid and before_uid != state['before_uid'])):
+    if state and (state['folder'] != folder or state['query'] != cursor_query or (before_uid and before_uid != state['before_uid'])):
         raise ValueError('Search cursor belongs to another folder/query/before_uid; restart the search.')
     client = connect()
     try:
@@ -471,7 +583,7 @@ def _search_window(folder='INBOX', sender='', subject='', text='', since='', unr
         all_uids = _search_uids(client)
         if state is None:
             candidates = [uid for uid in all_uids[-1000:] if not before_uid or uid < before_uid]
-            state = {'account_binding': account_binding, 'folder': folder, 'validity': validity, 'query': query, 'before_uid': before_uid,
+            state = {'account_binding': account_binding, 'folder': folder, 'validity': validity, 'query': cursor_query, 'before_uid': before_uid,
                      'lower': min(candidates, default=0), 'upper': max(candidates, default=0), 'mailbox_upper': max(all_uids, default=0),
                      'older_excluded': max(0, len(all_uids) - 1000),
                      'candidate_total': len(candidates), 'uid_hash': _search_uid_hash(candidates), 'last': 0,
@@ -482,10 +594,12 @@ def _search_window(folder='INBOX', sender='', subject='', text='', since='', unr
         if _search_uid_hash(bounded) != state['uid_hash']: state['membership_changed'] = True
         if any(uid > state['mailbox_upper'] for uid in all_uids): state['new_messages_seen'] = True
         pending = [uid for uid in reversed(bounded) if not state['last'] or uid < state['last']]
-        page = pending[:scan_limit]
+        page = pending[:min(scan_limit, 25) if content_search else scan_limit]
+        content_budget = [20 * 1024 * 1024]
         items, failures, skipped, encoding_warnings = [], [], [], []
         nonconformant_this_page = 0
         scanned_this_page = 0
+        budget_exhausted = False
         for offset in range(0, len(page), 25):
             batch = page[offset:offset + 25]
             try:
@@ -494,6 +608,7 @@ def _search_window(folder='INBOX', sender='', subject='', text='', since='', unr
             except Exception:
                 found = {uid: (None, None, 'Header FETCH failed; candidate not searched.') for uid in batch}
             for uid in batch:
+                previous_last = state['last']
                 state['last'] = uid; state['scanned'] += 1; scanned_this_page += 1
                 if uid not in found:
                     state['skipped'] += 1; skipped.append({'uid': uid, 'reason': 'UID missing from FETCH; deleted or unavailable.'})
@@ -517,15 +632,25 @@ def _search_window(folder='INBOX', sender='', subject='', text='', since='', unr
                                (not rfc_message_id or candidate_id == rfc_message_id) and
                                (not day or internal_day >= day) and
                                (not unread_only or not re.search(rb'(?:^|\s)\\Seen(?:\s|$)', flags.group(1), re.I)))
+                    if matches and content_search:
+                        content_size = _search_content_size(client, uid)
+                        if content_size + 1 > content_budget[0]:
+                            budget_exhausted = True
+                            state['last'] = previous_last
+                            state['scanned'] -= 1; scanned_this_page -= 1
+                            break
+                        full_message = _search_full_message(client, uid, content_budget, content_size)
+                        content_matches = _search_content(full_message, **content_query)
+                        matches = matches and content_matches
                     if matches: items.append(_summary(msg, _identifier(folder, validity, str(uid), client)))
                 except Exception:
-                    state['failed'] += 1; failures.append({'uid': uid, 'reason': error or 'Headers, encoding or required metadata could not be decoded reliably.'})
+                    state['failed'] += 1; failures.append({'uid': uid, 'reason': error or ('Message content, size, encoding or metadata could not be verified; candidate not searched.' if content_search else 'Headers, encoding or required metadata could not be decoded reliably.')})
                 if candidate_warnings:
                     nonconformant_this_page += 1; state['nonconformant_candidates'] += 1
                     state['nonconformant_words'] += sum(warning['word_count'] for warning in candidate_warnings)
                     encoding_warnings.extend({'uid': uid, **warning} for warning in candidate_warnings)
                 if len(items) >= limit: break
-            if len(items) >= limit: break
+            if len(items) >= limit or budget_exhausted: break
         verification_error = ''
         try:
             final_uids = _search_uids(client)
@@ -561,7 +686,17 @@ def _search_window(folder='INBOX', sender='', subject='', text='', since='', unr
                     'examine_exists': exists, 'enumerated_total_at_start': len(all_uids), 'enumerated_total_at_end': len(final_uids),
                     'enumeration_unverified': state['enumeration_unverified'],
                     'boundary_note': 'Only the initial recent-1000 UID window, never a whole-mailbox completeness claim. Concurrent arrivals are excluded and older messages never backfill deletions; window changes prevent completeness. Flags are per-FETCH observations, not an atomic unread snapshot. Changes after final enumeration are outside this observation.'}
-        return {'folder': folder, 'items': items, 'next_before_uid': state['last'] if not exhausted else None,
+        if content_search:
+            coverage.update(scope='initial latest at most 1000 messages; queried headers, decoded non-attachment body text and attachment metadata only',
+                            complete_scope='initial_recent_1000_content_window_only',
+                            content_download_note='Entire messages include attachment bytes; attachments are never executed or searched. PEEK requests reserve SIZE+1 bytes; limits depend on server compliance because imaplib receives literals before application checks.',
+                            attachment_type_note='Declared MIME type only; file contents are not inspected or verified.',
+                            body_text_note='Each non-attachment plain/HTML part is searched separately; HTML text is static and excludes script/style/head/template, with no CSS layout or rendering.',
+                            content_filters={'text': bool(text), 'has_attachment': has_attachment,
+                                             'attachment_name': bool(attachment_name), 'attachment_type': bool(attachment_type)},
+                            content_max_message_bytes=MAX_MESSAGE, content_page_budget_bytes=20 * 1024 * 1024,
+                            content_bytes_reserved_this_page=20 * 1024 * 1024 - content_budget[0], content_candidate_cap_per_page=25)
+        return {'folder': folder, 'items': items, 'next_before_uid' : state['last'] if not exhausted else None,
                 'next_cursor': _search_cursor(state) if not exhausted else None,
                 'status': 'window_complete' if complete else 'partial' if (state['failed'] or state['skipped'] or state['membership_changed'] or state['new_messages_seen'] or state['enumeration_unverified']) else 'in_progress',
                 'coverage': coverage, 'failures': failures, 'skipped': skipped, 'encoding_warnings': encoding_warnings}

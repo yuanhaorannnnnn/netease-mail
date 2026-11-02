@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "netease-mail",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "测试版网易个人邮箱本地 MCP：搜索、读信、附件、草稿与授权发送；移动邮件暂不可用。",
   "extensions": {
     "com.openai": {
