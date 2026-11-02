@@ -1,11 +1,11 @@
 {
   "status": "release-candidate",
   "files": {
-    "SKILL.md": "185a07c28f3877a96cd3816f0cee4a1a8fe9b92c09dcd8a0fd9e16d0afa2dc88",
+    "SKILL.md": "fd1185ebdfa661b1a217a7f81915e880cb57d7a9d9927cc186d292c38f3c5791",
     "README.md": "a13a7806da70e4186738e3c71f4ae7bdf1cd161838bd3f7a06fc551d408a9b8f",
-    "scripts/server.py": "8aeb6f06d627e417b754119fc1d73b703e86b85a556ff5c5e3cb413924630d52",
+    "scripts/server.py": "af43d9a49a802782e65978f9672045f0a3bba3ab5b9a416756b6db009968b7c0",
     "scripts/configure.py": "cc55dcc4f1ce242973e152010e3f3b8f04ea605e6a5c6258eedff76c246c723d",
-    "scripts/test_server.py": "674709599a1144c87a4d473a2b7fa40f65a53a371d7294966943035ac24cc4d8",
+    "scripts/test_server.py": "188617e3af086a17b545f6768962c9f345a6b6d49e4e30d04852c1ce8d470003",
     "scripts/test_configure.py": "e8386973c6bef342c077c069f9961f2981de786aa633078c8f4ac6cd97878c67"
   },
   "package_note": "Skill README adapted to this standalone repository; remaining files track the accepted source snapshot."

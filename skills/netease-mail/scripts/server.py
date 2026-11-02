@@ -9,7 +9,7 @@ import hmac
 from email import encoders, policy
 from email.header import decode_header, make_header
 from email.message import EmailMessage
-from email.utils import getaddresses, make_msgid, formatdate
+from email.utils import getaddresses, make_msgid, formatdate, parsedate_to_datetime
 import imaplib
 import json
 import os
@@ -19,6 +19,8 @@ import re
 import secrets
 import smtplib
 import ssl
+import threading
+import time
 import unicodedata
 from typing import Literal
 
@@ -34,6 +36,11 @@ SERVER_REVISION = '2026-11-02-recent-1000-header-search-v6'
 SERVER_STARTED_AT = datetime.datetime.now(datetime.timezone.utc).isoformat()
 SERVER_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 _SEARCH_CURSOR_KEY = secrets.token_bytes(32)
+_CONVERSATION_STATES = {}
+_CONVERSATION_LOCK = threading.Lock()
+_CONVERSATION_TTL = 900
+_CONVERSATION_MAX_STATES = 8
+_CONVERSATION_MAX_BYTES = 4 * 1024 * 1024
 MAX_MESSAGE = 15 * 1024 * 1024
 MAX_ATTACHMENT = 5 * 1024 * 1024
 MAX_ATTACHMENTS = 10 * 1024 * 1024
@@ -274,33 +281,36 @@ def list_folders() -> dict:
     """List IMAP folder identifiers. Names may use modified UTF-7; pass them back unchanged."""
     client = connect()
     try:
-        rows = _ok(client.list(), 'list')
-        folders = []
-        for row in rows:
-            # imaplib appends an empty trailer after a mailbox-name literal.
-            if row == b'' or (row is None and rows == [None]): continue
-            prefix = row[0] if isinstance(row, tuple) and len(row) == 2 else row
-            match = re.fullmatch(rb'\((.*?)\)\s+(?:"(?:[^"\\]|\\.)*"|NIL)\s+(.*)', prefix) if isinstance(prefix, bytes) else None
-            if not match: raise ValueError('Unsupported IMAP LIST response; folder list is incomplete.')
-            name = match.group(2)
-            if isinstance(row, tuple):
-                length = re.fullmatch(rb'\{(\d+)\}', name)
-                if not length or not isinstance(row[1], bytes) or len(row[1]) != int(length.group(1)):
-                    raise ValueError('Malformed IMAP LIST literal; folder list is incomplete.')
-                name = row[1]
-            elif re.fullmatch(rb'"(?:[^"\\]|\\.)*"', name):
-                name = re.sub(rb'\\(.)', rb'\1', name[1:-1])
-            elif not re.fullmatch(rb'[^\x00-\x20\x7f(){%*"\\]+', name):
-                raise ValueError('Unsupported IMAP LIST mailbox name; folder list is incomplete.')
-            try:
-                identifier = name.decode('ascii')
-                _folder(identifier)
-                folders.append({'id': identifier, 'attributes': match.group(1).decode('ascii')})
-            except (UnicodeDecodeError, ValueError):
-                raise ValueError('Unsupported IMAP LIST folder identifier; folder list is incomplete.') from None
-        return {'folders': folders}
+        return {'folders': _listed_folders(client)}
     finally: _logout(client)
 
+
+def _listed_folders(client):
+    rows = _ok(client.list(), 'list')
+    folders = []
+    for row in rows:
+        # imaplib appends an empty trailer after a mailbox-name literal.
+        if row == b'' or (row is None and rows == [None]): continue
+        prefix = row[0] if isinstance(row, tuple) and len(row) == 2 else row
+        match = re.fullmatch(rb'\((.*?)\)\s+(?:"(?:[^"\\]|\\.)*"|NIL)\s+(.*)', prefix) if isinstance(prefix, bytes) else None
+        if not match: raise ValueError('Unsupported IMAP LIST response; folder list is incomplete.')
+        name = match.group(2)
+        if isinstance(row, tuple):
+            length = re.fullmatch(rb'\{(\d+)\}', name)
+            if not length or not isinstance(row[1], bytes) or len(row[1]) != int(length.group(1)):
+                raise ValueError('Malformed IMAP LIST literal; folder list is incomplete.')
+            name = row[1]
+        elif re.fullmatch(rb'"(?:[^"\\]|\\.)*"', name):
+            name = re.sub(rb'\\(.)', rb'\1', name[1:-1])
+        elif not re.fullmatch(rb'[^\x00-\x20\x7f(){%*"\\]+', name):
+            raise ValueError('Unsupported IMAP LIST mailbox name; folder list is incomplete.')
+        try:
+            identifier = name.decode('ascii')
+            _folder(identifier)
+            folders.append({'id': identifier, 'attributes': match.group(1).decode('ascii')})
+        except (UnicodeDecodeError, ValueError):
+            raise ValueError('Unsupported IMAP LIST folder identifier; folder list is incomplete.') from None
+    return folders
 
 def _search_normalize(value):
     return unicodedata.normalize('NFC', value).casefold()
@@ -627,6 +637,320 @@ def read_thread(folder: str, message_id: str, scan_limit: int = 50) -> dict:
         return {'folder': folder, 'items': items, 'complete': False, 'scanned': len(nodes),
                 'reason': 'Only one folder and a bounded set of headers were scanned; missing or duplicated Message-ID headers, other folders and server behavior can hide or ambiguously link messages.'}
     finally: _logout(client)
+
+
+def _conversation_ids(msg, name):
+    values = [str(value) for key, value in msg.raw_items() if key.lower() == name.lower()]
+    if not values: return []
+    if len(values) != 1: raise ValueError(f'Duplicate {name} header; links ignored.')
+    value = re.sub(r'\r?\n[ \t]+', ' ', values[0]).strip(' \t')
+    tokens = re.findall(r'<[^<>]*>', value)
+    if (not tokens or len(tokens) > 64 or re.sub(r'<[^<>]*>', '', value).strip(' \t') or
+            any(len(token) > 998 or _canonical_message_id(token) != token for token in tokens) or
+            len(set(tokens)) != len(tokens)):
+        raise ValueError(f'Malformed or unsupported {name} header; links ignored.')
+    if name == 'In-Reply-To' and len(tokens) != 1:
+        raise ValueError('Multiple In-Reply-To identifiers; links ignored.')
+    return tokens
+
+
+def _conversation_node(client, folder, validity, uid, raw):
+    if len(raw) > 16384: raise ValueError('Conversation header exceeds 16 KiB; links not examined.')
+    msg = _message(raw)
+    if msg.defects: raise ValueError('Malformed conversation header block; links not examined.')
+    own = _valid_message_id(msg)
+    warning = ''
+    refs, reply, parent = [], [], None
+    try:
+        if not own: raise ValueError('Missing, invalid or duplicate Message-ID; links ignored.')
+        refs = _conversation_ids(msg, 'References')
+        reply = _conversation_ids(msg, 'In-Reply-To')
+        if reply and refs and reply[0] != refs[-1]:
+            raise ValueError('In-Reply-To conflicts with final References identifier; links ignored.')
+        parent = reply[0] if reply else refs[-1] if refs else None
+        if own in refs or own in reply: raise ValueError('Self-referencing identifier; links ignored.')
+    except ValueError as error:
+        warning = str(error); parent = None
+    date_utc = None
+    try:
+        date = msg.get('Date')
+        if len(msg.get_all('Date', [])) != 1 or getattr(date, 'defects', ()): raise ValueError()
+        parsed = parsedate_to_datetime(str(date))
+        if parsed.tzinfo is None or parsed.utcoffset() is None: raise ValueError()
+        date_utc = parsed.astimezone(datetime.timezone.utc).isoformat()
+    except (ValueError, TypeError, OverflowError): pass
+    return {'item': {**_summary(msg, _identifier(folder, validity, str(uid), client)), 'folder': folder,
+                     'date_order_utc': date_utc, 'date_order_status': 'parsed_untrusted_header' if date_utc else 'missing_invalid_or_timezone_unknown'},
+            'own': own, 'parent': parent, 'references': refs, 'in_reply_to': reply, 'warning': warning}
+
+
+def _conversation_fetch(client, folder, validity, batch, state):
+    try:
+        rows = _ok(client.uid('FETCH', ','.join(map(str, batch)), '(UID BODY.PEEK[HEADER.FIELDS (DATE FROM TO CC BCC SUBJECT MESSAGE-ID REFERENCES IN-REPLY-TO)])'), 'conversation header fetch')
+        found = _search_fetch_rows(rows, set(batch))
+    except Exception:
+        found = {}
+    failures = []
+    for uid in batch:
+        try:
+            metadata, raw, error = found.get(uid, (None, None, 'Requested UID missing from FETCH; deleted, unavailable or mismatched.'))
+            if error: raise ValueError(error)
+            node = _conversation_node(client, folder, validity, uid, raw)
+            retained = len(json.dumps(node, ensure_ascii=True).encode('ascii'))
+            if state['retained_bytes'] + retained > _CONVERSATION_MAX_BYTES:
+                raise ValueError('Conversation state reached 4 MiB privacy/memory limit; candidate not retained.')
+            state['nodes'][node['item']['id']] = node
+            state['retained_bytes'] += retained
+        except Exception as error:
+            failures.append({'uid': uid, 'reason': str(error) if isinstance(error, ValueError) else 'Header parse failed; links not examined.'})
+    return failures
+
+
+def _conversation_snapshot(client, folder):
+    validity, exists = select(client, folder, include_exists=True)
+    uids = _search_uids(client)
+    window = uids[-1000:]
+    return {'folder': folder, 'uidvalidity': validity, 'uids': window, 'pending': list(reversed(window)),
+            'initial_uid_hash': _search_uid_hash(window), 'initial_mailbox_upper_uid': max(uids, default=0),
+            'initial_mailbox_total': len(uids), 'initial_candidate_total': len(window),
+            'older_messages_excluded': max(0, len(uids) - 1000), 'scanned_total': 0, 'failed_total': 0,
+            'membership_changed': False, 'new_messages_seen': False,
+            'enumeration_unverified': exists is None or exists != len(uids), 'failures': []}
+
+
+def _conversation_verify(client, snapshot):
+    try:
+        validity, exists = select(client, snapshot['folder'], include_exists=True)
+        if validity != snapshot['uidvalidity']:
+            snapshot['identity_invalidated'] = True
+            raise ValueError('Mailbox UIDVALIDITY changed; initial snapshot is no longer readable.')
+        uids = _search_uids(client)
+        final_validity, final_exists = select(client, snapshot['folder'], include_exists=True)
+        if final_validity != snapshot['uidvalidity']:
+            snapshot['identity_invalidated'] = True
+            raise ValueError('Mailbox UIDVALIDITY changed during enumeration.')
+        lower = min(snapshot['uids'], default=0); upper = max(snapshot['uids'], default=0)
+        bounded = [uid for uid in uids if lower <= uid <= upper]
+        if _search_uid_hash(bounded) != snapshot['initial_uid_hash']: snapshot['membership_changed'] = True
+        if any(uid > snapshot['initial_mailbox_upper_uid'] for uid in uids): snapshot['new_messages_seen'] = True
+        if exists is None or exists != len(uids) or final_exists != len(uids): snapshot['enumeration_unverified'] = True
+        snapshot['last_mailbox_total'] = len(uids)
+        return True
+    except Exception:
+        snapshot['enumeration_unverified'] = True
+        snapshot['verification_error'] = 'Folder unavailable, UIDVALIDITY changed or UID enumeration failed; completeness cannot be established.'
+        return False
+
+
+def _conversation_result(state, scanned_this_page):
+    nodes = state['nodes']; anchor = state['message_id']
+    by_id = {}
+    for key, node in nodes.items():
+        if node['own']: by_id.setdefault(node['own'], []).append(key)
+    duplicates = {own: keys for own, keys in by_id.items() if len(keys) > 1}
+    edges = []
+    unresolved = []
+    for key, node in nodes.items():
+        parent = node['parent']
+        if not parent or node['warning']: continue
+        if node['own'] in duplicates or parent in duplicates:
+            unresolved.append({'id': key, 'parent_message_id': parent, 'reason': 'Duplicate Message-ID; edge quarantined.'})
+        elif parent not in by_id:
+            unresolved.append({'id': key, 'parent_message_id': parent, 'reason': 'Referenced parent not observed; no shared-reference bridge inferred.'})
+        else:
+            edges.append({'child_id': key, 'parent_id': by_id[parent][0], 'parent_message_id': parent,
+                          'evidence': 'In-Reply-To' if node['in_reply_to'] else 'final References identifier'})
+    matched = {anchor}
+    changed = True
+    while changed:
+        changed = False
+        for edge in edges:
+            if edge['child_id'] in matched or edge['parent_id'] in matched:
+                for key in (edge['child_id'], edge['parent_id']):
+                    if key not in matched: matched.add(key); changed = True
+    # Duplicate copies are useful candidates, but never become a traversal bridge.
+    ambiguous = set()
+    candidate_evidence = []
+    anchor_own = nodes.get(anchor, {}).get('own')
+    matched_own = {nodes[key]['own'] for key in matched if key in nodes and nodes[key]['own']}
+    for key, node in nodes.items():
+        if anchor_own in duplicates and (node['own'] == anchor_own or node['parent'] == anchor_own):
+            ambiguous.add(key)
+            candidate_evidence.append({'id': key, 'message_id': anchor_own, 'reason': 'Anchor Message-ID has multiple stored copies; direct copy/reply candidate only.'})
+        if key in matched and node['parent'] in duplicates:
+            ambiguous.update(duplicates[node['parent']])
+            candidate_evidence.append({'id': key, 'message_id': node['parent'], 'reason': 'Parent Message-ID has multiple stored copies; copies are candidates only.'})
+        if node['own'] in duplicates and node['parent'] in matched_own:
+            ambiguous.add(key)
+            candidate_evidence.append({'id': key, 'message_id': node['own'], 'reason': 'Direct reply has a duplicated Message-ID; candidate only, not traversed.'})
+        if key in matched and node['own'] in duplicates and node['parent'] in by_id:
+            ambiguous.update(by_id[node['parent']])
+            candidate_evidence.append({'id': key, 'message_id': node['parent'], 'reason': 'Anchor has a duplicated Message-ID; its direct parent is a candidate only, not traversed.'})
+    relevant = matched | ambiguous
+    coverage = []
+    for snapshot in state['snapshots']:
+        entry = {key: value for key, value in snapshot.items() if key not in ('uids', 'pending', 'failures')}
+        entry['remaining_candidates'] = len(snapshot['pending'])
+        entry['snapshot_exhausted'] = not snapshot['pending']
+        entry['complete'] = entry['snapshot_exhausted'] and not any(snapshot.get(key) for key in ('failed_total', 'membership_changed', 'new_messages_seen', 'enumeration_unverified'))
+        entry['failures'] = list(snapshot['failures'])
+        coverage.append(entry)
+    exhausted = all(not snapshot['pending'] for snapshot in state['snapshots'])
+    window_complete = bool(coverage) and all(entry['complete'] for entry in coverage) and not state['scope_errors']
+    partial = bool(state['scope_errors']) or any(any(entry.get(key) for key in ('failed_total', 'membership_changed', 'new_messages_seen', 'enumeration_unverified')) for entry in coverage)
+    return {'folder': state['folder'], 'anchor_id': anchor,
+            'items': [{**node['item'], 'association': 'anchor' if key == anchor else 'ambiguous_duplicate_candidate' if key in ambiguous else 'provisional_header_linked_candidate' if not exhausted else 'header_linked_candidate',
+                       'link_warning': node['warning']} for key, node in sorted(nodes.items(), key=lambda pair: (pair[1]['item']['date_order_utc'] is None, pair[1]['item']['date_order_utc'] or '', pair[0])) if key in relevant],
+            'edges': [edge for edge in edges if edge['child_id'] in matched and edge['parent_id'] in matched],
+            'duplicate_message_ids': [{'message_id': own, 'stored_messages': [nodes[key]['item'] for key in keys]} for own, keys in duplicates.items() if any(key in relevant for key in keys)],
+            'candidate_evidence': candidate_evidence,
+            'header_warnings': [{'id': key, 'folder': node['item']['folder'], 'reason': node['warning']} for key, node in nodes.items() if node['warning'] and key in relevant],
+            'unresolved_links': [link for link in unresolved if link['id'] in relevant], 'scope_errors': list(state['scope_errors']), 'complete': False,
+            'status': 'partial' if partial else 'window_complete' if window_complete else 'in_progress',
+            'coverage': {'folders': coverage, 'candidate_cap_per_folder': 1000, 'scanned_this_page': scanned_this_page,
+                         'complete': window_complete, 'snapshot_exhausted': exhausted, 'anchor': dict(state['anchor_coverage']),
+                         'header_warning_total': sum(bool(node['warning']) for node in nodes.values()), 'duplicate_id_total': len(duplicates),
+                         'scope': 'INBOX and the unique LIST SPECIAL-USE \\Sent folder; initial latest at most 1000 UIDs per folder, plus the explicitly requested anchor only',
+                         'retained_bytes': state['retained_bytes'], 'state_expires_in_seconds': max(0, int(state['expires'] - time.monotonic()))},
+            'next_cursor': '' if exhausted else _search_cursor({'kind': 'conversation', 'token': state['token'], 'version': state['version'], 'folder': state['folder'], 'message_id': anchor}),
+            'reason': 'Header-linked candidates only; subjects never link messages. Only the nearest observed unambiguous parent links; missing references and duplicate IDs never bridge messages. All links are untrusted and do not authenticate sender identity. Items display ascending parsed timezone-aware Date headers; missing/invalid/unknown-timezone dates sort last by stable stored id. Date is untrusted display order, not a verified event timeline. In-progress candidates may be removed when later pages reveal duplicate IDs. Window completion never proves a complete conversation or Message-ID uniqueness outside the observed window. Folder observations are sequential, not an atomic mailbox snapshot; changes after final checks are outside this observation.'}
+
+
+def _conversation_expire(token):
+    with _CONVERSATION_LOCK:
+        state = _CONVERSATION_STATES.get(token)
+        if state is None: return
+        if not state['lock'].locked() and state['expires'] <= time.monotonic():
+            del _CONVERSATION_STATES[token]
+            return
+        timer = threading.Timer(max(1, state['expires'] - time.monotonic()), _conversation_expire, args=(token,))
+        timer.daemon = True
+        state['expiry_timer'] = timer
+        timer.start()
+
+
+@mcp.tool(annotations=READ)
+def read_conversation(folder: str, message_id: str, scan_limit: int = 200, cursor: str = '') -> dict:
+    """Read-only cross-folder header conversation candidates anchored by an account/folder-bound message id. Automatically discovers the unique LIST SPECIAL-USE \\Sent folder plus INBOX; never guesses Sent by name. Any anchor folder is allowed, but only the anchor is additionally fetched there. Each page scans at most scan_limit (1–500) candidates in batches of 25, plus an initial anchor fetch. Each folder freezes its initial latest at most 1000 UIDs. Follow next_cursor; results are cumulative and provisional until exhausted, with duplicate/invalid IDs quarantined. The signed, single-use cursor binds account/anchor and expires after 15 minutes or process restart; at most 8 scans and 4 MiB serialized retained data per scan (not an actual process-memory limit). Bodies/attachments are not fetched and Seen is never set. complete is always false for the conversation; coverage.complete covers only the declared header windows."""
+    if not 1 <= scan_limit <= 500: raise ValueError('scan_limit must be 1–500.')
+    _folder(folder)
+    state = None
+    if cursor:
+        payload = _search_resume(cursor)
+        if payload.get('kind') != 'conversation' or payload.get('folder') != folder or payload.get('message_id') != message_id:
+            raise ValueError('Conversation cursor belongs to another anchor/query; restart without cursor.')
+        with _CONVERSATION_LOCK:
+            state = _CONVERSATION_STATES.get(payload.get('token'))
+        if state is None or state['expires'] <= time.monotonic():
+            raise ValueError('Conversation scan expired, was evicted or server restarted; restart without cursor.')
+        if not state['lock'].acquire(blocking=False): raise ValueError('Conversation page is already running; do not consume this cursor concurrently.')
+        with _CONVERSATION_LOCK:
+            live = _CONVERSATION_STATES.get(payload.get('token')) is state and state['expires'] > time.monotonic()
+        if not live:
+            state['lock'].release()
+            raise ValueError('Conversation scan expired or was evicted; restart without cursor.')
+        if payload.get('version') != state['version']:
+            state['lock'].release()
+            raise ValueError('Conversation cursor already consumed; use the latest returned cursor or restart.')
+    client = None
+    page_started = False
+    try:
+        client = connect()
+        binding = _account_binding(client)
+        if state is not None:
+            if state['account_binding'] != binding: raise ValueError('Conversation cursor belongs to another authenticated account; restart without cursor.')
+        else:
+            validity = select(client, folder)
+            uid = int(_uid(message_id, folder, validity, client))
+            state = {'folder': folder, 'message_id': message_id, 'account_binding': binding,
+                     'expires': time.monotonic() + _CONVERSATION_TTL, 'token': secrets.token_urlsafe(24), 'version': 0,
+                     'lock': threading.Lock(), 'nodes': {}, 'retained_bytes': 0, 'snapshots': [], 'scope_errors': []}
+            state['lock'].acquire()
+            failures = _conversation_fetch(client, folder, validity, [uid], state)
+            if failures: raise ValueError('Anchor header could not be read with its requested UID; restart from a readable message.')
+            state['anchor_coverage'] = {'folder': folder, 'uidvalidity': validity, 'uid': uid, 'separately_fetched_headers': 1, 'outside_scanned_windows': True}
+            scope = [folder if folder.upper() == 'INBOX' else 'INBOX']
+            try:
+                sent = [entry['id'] for entry in _listed_folders(client) if '\\sent' in entry['attributes'].lower().split()]
+                if len(sent) != 1 or sent[0].upper() == 'INBOX': raise ValueError('LIST must identify exactly one distinct SPECIAL-USE \\Sent folder; no name was guessed.')
+                scope.append(sent[0])
+            except Exception:
+                state['scope_errors'].append({'folder': 'SPECIAL-USE \\Sent', 'reason': 'Sent discovery failed or was ambiguous; sent mail was not searched and no name was guessed.'})
+            for target in scope:
+                try:
+                    snapshot = _conversation_snapshot(client, target)
+                    state['snapshots'].append(snapshot)
+                    if target == folder and snapshot['uidvalidity'] == validity and uid in snapshot['uids']:
+                        state['anchor_coverage']['outside_scanned_windows'] = False
+                except Exception:
+                    state['scope_errors'].append({'folder': target, 'reason': 'Folder selection or initial UID enumeration failed; this folder was not searched.'})
+            with _CONVERSATION_LOCK:
+                now = time.monotonic()
+                for token, cached in list(_CONVERSATION_STATES.items()):
+                    if cached['expires'] <= now and not cached['lock'].locked(): del _CONVERSATION_STATES[token]
+                if len(_CONVERSATION_STATES) >= _CONVERSATION_MAX_STATES:
+                    raise ValueError('Too many active conversation scans; finish a scan or wait for its 15-minute expiry.')
+                _CONVERSATION_STATES[state['token']] = state
+                timer = threading.Timer(_CONVERSATION_TTL, _conversation_expire, args=(state['token'],))
+                timer.daemon = True; state['expiry_timer'] = timer; timer.start()
+        page_started = True
+        scanned = 0
+        for snapshot in state['snapshots']:
+            verified = _conversation_verify(client, snapshot)
+            if snapshot.get('identity_invalidated'):
+                state['invalidated'] = True
+                raise ValueError('Conversation scan invalidated by UIDVALIDITY change; discard prior pages and restart without cursor.')
+            if not verified:
+                snapshot['failed_total'] += len(snapshot['pending']); snapshot['pending'] = []
+        while scanned < scan_limit and any(snapshot['pending'] for snapshot in state['snapshots']):
+            count = len(state['snapshots'])
+            index = state.get('next_folder_index', 0) % count
+            while not state['snapshots'][index]['pending']: index = (index + 1) % count
+            snapshot = state['snapshots'][index]
+            state['next_folder_index'] = (index + 1) % count
+            validity = select(client, snapshot['folder'])
+            if validity != snapshot['uidvalidity']:
+                state['invalidated'] = True
+                raise ValueError('Conversation scan invalidated by UIDVALIDITY change; discard prior pages and restart without cursor.')
+            batch = snapshot['pending'][:min(25, scan_limit - scanned)]
+            snapshot['pending'] = snapshot['pending'][len(batch):]
+            # The anchor was fetched separately; count its window visit without retaining a second copy.
+            fetch = [uid for uid in batch if _identifier(snapshot['folder'], snapshot['uidvalidity'], str(uid), client) not in state['nodes']]
+            failures = _conversation_fetch(client, snapshot['folder'], snapshot['uidvalidity'], fetch, state) if fetch else []
+            snapshot['failures'].extend(failures); snapshot['failed_total'] += len(failures)
+            snapshot['scanned_total'] += len(batch); scanned += len(batch)
+        for snapshot in state['snapshots']:
+            _conversation_verify(client, snapshot)
+            if snapshot.get('identity_invalidated'):
+                state['invalidated'] = True
+                raise ValueError('Conversation scan invalidated by UIDVALIDITY change; discard prior pages and restart without cursor.')
+        try:
+            anchor_validity = select(client, state['folder'])
+            if anchor_validity != state['anchor_coverage']['uidvalidity']:
+                state['invalidated'] = True
+                raise ValueError('Conversation anchor UIDVALIDITY changed; discard prior pages and restart without cursor.')
+        except ValueError:
+            if state.get('invalidated'): raise
+            state['scope_errors'].append({'folder': state['folder'], 'reason': 'Anchor folder could not be rechecked; anchor identity observation is incomplete.'})
+        state['version'] += 1
+        result = _conversation_result(state, scanned)
+        if not result['next_cursor']:
+            with _CONVERSATION_LOCK:
+                _CONVERSATION_STATES.pop(state['token'], None)
+                state['expiry_timer'].cancel()
+        return result
+    except Exception:
+        if state is not None and (not cursor or page_started or state.get('invalidated')):
+            state['nodes'].clear()
+            with _CONVERSATION_LOCK:
+                _CONVERSATION_STATES.pop(state['token'], None)
+                if state.get('expiry_timer'): state['expiry_timer'].cancel()
+            if cursor and page_started and not state.get('invalidated'):
+                raise ValueError('Conversation page interrupted after scan state changed; discard prior pages and restart without cursor.') from None
+        raise
+    finally:
+        if client is not None: _logout(client)
+        if state is not None and state['lock'].locked(): state['lock'].release()
 
 
 @mcp.tool(annotations=READ)

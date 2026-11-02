@@ -92,6 +92,275 @@ class WireImap(imaplib.IMAP4):
     def logout(self): pass
 
 
+class ConversationImap(FakeImap):
+    def __init__(self, folders, sent='Sent Items'):
+        super().__init__()
+        self.folders = {name: dict(messages) for name, messages in folders.items()}
+        self.sent = sent; self.selected = None; self.validities = {name: b'42' for name in folders}
+        self.search_counts = {}; self.on_search = None; self.fetch_failures = set(); self.mismatched_uids = set()
+        self.list_rows = None; self.unavailable = set()
+    def list(self):
+        self.calls.append(('list',))
+        return 'OK', self.list_rows if self.list_rows is not None else [b'(\\Inbox) "/" INBOX', ('(\\Sent) "/" "%s"' % self.sent).encode()]
+    def select(self, folder, readonly=True):
+        self.calls.append(('select', folder, readonly))
+        self.selected = folder.decode()[1:-1]
+        if self.selected in self.unavailable: return 'NO', [b'unavailable']
+        return 'OK', [str(len(self.folders[self.selected])).encode()]
+    def response(self, name): return 'UIDVALIDITY', [self.validities[self.selected]]
+    def uid(self, *args):
+        self.calls.append((self.selected, *args))
+        messages = self.folders[self.selected]
+        if args[0] == 'SEARCH':
+            self.search_counts[self.selected] = self.search_counts.get(self.selected, 0) + 1
+            if self.on_search: self.on_search(self, self.selected, self.search_counts[self.selected])
+            return 'OK', [' '.join(map(str, sorted(messages))).encode()]
+        if args[0] == 'FETCH':
+            if 'BODY.PEEK[HEADER.FIELDS' not in args[2]: raise AssertionError('Conversation must only read headers with PEEK')
+            requested = list(map(int, args[1].split(',')))
+            if len(requested) > 25: raise AssertionError('Unbounded FETCH')
+            if self.selected in self.fetch_failures: return 'NO', [b'header fetch rejected']
+            return 'OK', [(f'{uid} (UID {uid + 10000 if (self.selected, uid) in self.mismatched_uids else uid} BODY[HEADER.FIELDS (MESSAGE-ID)] {{99}}'.encode(), messages[uid]) for uid in reversed(requested) if uid in messages]
+        raise AssertionError('Unexpected command or mutation')
+
+
+class TestConversation(unittest.TestCase):
+    def tearDown(self):
+        for state in server._CONVERSATION_STATES.values(): state['expiry_timer'].cancel()
+        server._CONVERSATION_STATES.clear()
+    @staticmethod
+    def message(own, parent='', extra=b''):
+        return (f'Message-ID: <{own}@example.org>\r\nSubject: Same\r\n' + (f'In-Reply-To: <{parent}@example.org>\r\n' if parent else '')).encode() + extra + b'\r\n'
+    def run_scan(self, c, **kwargs):
+        with patch.object(server, 'connect', return_value=c):
+            return server.read_conversation('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1', **kwargs)
+    def test_cross_folder_nearest_parent_links_only_and_readonly(self):
+        c = ConversationImap({'INBOX': {1: self.message('root'), 2: self.message('unrelated')},
+                              'Sent Items': {5: self.message('reply', 'root'), 9: self.message('third', 'reply')}})
+        result = self.run_scan(c)
+        self.assertEqual({item['message_id'] for item in result['items']}, {'<root@example.org>', '<reply@example.org>', '<third@example.org>'})
+        self.assertEqual({item['folder'] for item in result['items']}, {'INBOX', 'Sent Items'})
+        self.assertTrue(result['coverage']['complete']); self.assertFalse(result['complete']); self.assertFalse(result['next_cursor'])
+        self.assertEqual(len(result['edges']), 2)
+        self.assertTrue(all(call[2] for call in c.calls if call[0] == 'select'))
+        self.assertTrue(all('PEEK' in call[-1] for call in c.calls if len(call) > 1 and call[1] == 'FETCH'))
+        self.assertTrue(asyncio.run(server.mcp.list_tools())[[tool.name for tool in asyncio.run(server.mcp.list_tools())].index('read_conversation')].annotations.readOnlyHint)
+    def test_shared_missing_reference_and_multi_reference_bridge_do_not_merge(self):
+        c = ConversationImap({'INBOX': {1: self.message('anchor', extra=b'References: <missing@example.org>\r\n'),
+                                      2: self.message('stranger', extra=b'References: <missing@example.org>\r\n'),
+                                      3: self.message('other-root')},
+                              'Sent Items': {4: self.message('malicious', extra=b'References: <anchor@example.org> <other-root@example.org>\r\n')}})
+        result = self.run_scan(c)
+        self.assertEqual([item['message_id'] for item in result['items']], ['<anchor@example.org>'])
+        self.assertEqual(len(result['unresolved_links']), 1)
+        self.assertNotIn('<stranger@example.org>', str(result))
+    def test_duplicate_copies_and_direct_replies_are_ambiguous_without_transitive_bridge(self):
+        c = ConversationImap({'INBOX': {1: self.message('root'), 2: self.message('reply', 'root')},
+                              'Sent Items': {1: self.message('root', 'unrelated'), 2: self.message('reply', 'root'),
+                                             3: self.message('grandchild', 'reply'), 4: self.message('unrelated')}})
+        result = self.run_scan(c)
+        self.assertEqual(len(result['items']), 4)
+        self.assertEqual(len(result['duplicate_message_ids']), 2)
+        self.assertEqual(result['edges'], [])
+        self.assertTrue(all(item['association'] in ('anchor', 'ambiguous_duplicate_candidate') for item in result['items']))
+        self.assertNotIn('<grandchild@example.org>', str(result))
+        self.assertNotIn('<unrelated@example.org>', {item['message_id'] for item in result['items']})
+    def test_malformed_conflicting_duplicate_and_multi_parent_headers_never_link(self):
+        extras = [b'In-Reply-To: <root@example.org> trailing\r\n',
+                  b'In-Reply-To: <root@example.org>\r\nIn-Reply-To: <other@example.org>\r\n',
+                  b'In-Reply-To: <root@example.org> <other@example.org>\r\n',
+                  b'In-Reply-To: <root@example.org>\r\nReferences: <other@example.org>\r\n',
+                  b'References: <root@example.org> <bad id@example.org>\r\n',
+                  b'Message-ID: <root@example.org>\r\nIn-Reply-To: <root@example.org>\r\n']
+        c = ConversationImap({'INBOX': {1: self.message('root'), **{uid: self.message(str(uid), extra=extra) for uid, extra in enumerate(extras, 2)}}, 'Sent Items': {}})
+        result = self.run_scan(c)
+        self.assertEqual(len(result['items']), 1); self.assertEqual(result['coverage']['header_warning_total'], len(extras))
+        self.assertEqual(result['header_warnings'], [])
+    def test_recent_1000_windows_and_outside_anchor_are_separately_counted(self):
+        c = ConversationImap({'INBOX': {uid: self.message(str(uid)) for uid in range(1, 1002)}, 'Sent Items': {}})
+        result = self.run_scan(c, scan_limit=500)
+        self.assertEqual(result['status'], 'in_progress'); self.assertTrue(result['coverage']['anchor']['outside_scanned_windows'])
+        with patch.object(server, 'connect', return_value=c):
+            final = server.read_conversation('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1', scan_limit=500, cursor=result['next_cursor'])
+        inbox = final['coverage']['folders'][0]
+        self.assertEqual(inbox['scanned_total'], 1000); self.assertEqual(inbox['older_messages_excluded'], 1)
+        self.assertEqual(final['coverage']['anchor']['separately_fetched_headers'], 1)
+        self.assertTrue(final['coverage']['complete'])
+        fetches = [call for call in c.calls if len(call) > 1 and call[1] == 'FETCH']
+        self.assertEqual(sum(len(call[2].split(',')) for call in fetches), 1001)
+    def test_default_page_interleaves_both_large_folders_and_finds_sent_reply_early(self):
+        c = ConversationImap({'INBOX': {uid: self.message('inbox-' + str(uid)) for uid in range(1, 1001)},
+                              'Sent Items': {uid: self.message('sent-' + str(uid), 'inbox-1' if uid == 1000 else '') for uid in range(1, 1001)}})
+        first = self.run_scan(c)
+        self.assertEqual([entry['scanned_total'] for entry in first['coverage']['folders']], [100, 100])
+        self.assertEqual(first['coverage']['scanned_this_page'], 200)
+        self.assertEqual({item['message_id'] for item in first['items']}, {'<inbox-1@example.org>', '<sent-1000@example.org>'})
+        batches = [call for call in c.calls if len(call) > 1 and call[1] == 'FETCH'][1:]
+        self.assertEqual([call[0] for call in batches], ['INBOX', 'Sent Items'] * 4)
+        self.assertTrue(all(len(call[2].split(',')) <= 25 for call in batches))
+        second = self.run_scan(c, cursor=first['next_cursor'])
+        self.assertEqual([entry['scanned_total'] for entry in second['coverage']['folders']], [200, 200])
+        self.assertEqual(second['coverage']['scanned_this_page'], 200)
+    def test_single_candidate_pages_resume_at_other_folder_without_starvation(self):
+        c = ConversationImap({'INBOX': {uid: self.message('inbox-' + str(uid)) for uid in range(1, 4)},
+                              'Sent Items': {uid: self.message('sent-' + str(uid)) for uid in range(1, 4)}})
+        result = self.run_scan(c, scan_limit=1)
+        observed = [[entry['scanned_total'] for entry in result['coverage']['folders']]]
+        while result['next_cursor']:
+            result = self.run_scan(c, scan_limit=1, cursor=result['next_cursor'])
+            observed.append([entry['scanned_total'] for entry in result['coverage']['folders']])
+            self.assertEqual(result['coverage']['scanned_this_page'], 1)
+        self.assertEqual(observed, [[1, 0], [1, 1], [2, 1], [2, 2], [3, 2], [3, 3]])
+        self.assertTrue(result['coverage']['complete'])
+    def test_exhausted_folder_does_not_waste_other_folder_page_budget(self):
+        c = ConversationImap({'INBOX': {uid: self.message('inbox-' + str(uid)) for uid in range(1, 71)},
+                              'Sent Items': {1: self.message('sent-1')}})
+        result = self.run_scan(c, scan_limit=51)
+        self.assertEqual([entry['scanned_total'] for entry in result['coverage']['folders']], [50, 1])
+        self.assertEqual(result['coverage']['scanned_this_page'], 51)
+        final = self.run_scan(c, scan_limit=51, cursor=result['next_cursor'])
+        self.assertEqual(final['coverage']['scanned_this_page'], 20)
+        self.assertTrue(final['coverage']['complete'])
+
+    def test_cursor_binding_stale_expired_and_concurrent_consumption(self):
+        c = ConversationImap({'INBOX': {1: self.message('root'), 2: self.message('child', 'root'), 3: self.message('third', 'child')}, 'Sent Items': {}})
+        first = self.run_scan(c, scan_limit=1); cursor = first['next_cursor']
+        with patch.object(server, 'connect') as connect:
+            with self.assertRaisesRegex(ValueError, 'another anchor'): server.read_conversation('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:2', cursor=cursor)
+            connect.assert_not_called()
+        state = next(iter(server._CONVERSATION_STATES.values()))
+        state['lock'].acquire()
+        try:
+            with self.assertRaisesRegex(ValueError, 'already running'): self.run_scan(c, cursor=cursor)
+        finally: state['lock'].release()
+        other = ConversationImap(c.folders); other._codex_account_address = 'other@163.com'
+        with self.assertRaisesRegex(ValueError, 'another authenticated account'): self.run_scan(other, cursor=cursor)
+        self.assertEqual(other.calls, [])
+        second = self.run_scan(c, scan_limit=1, cursor=cursor)
+        with self.assertRaisesRegex(ValueError, 'already consumed'): self.run_scan(c, cursor=cursor)
+        with patch.object(server.time, 'monotonic', return_value=state['expires'] + 1):
+            with self.assertRaisesRegex(ValueError, 'expired'): self.run_scan(c, cursor=second['next_cursor'])
+    def test_late_duplicate_retracts_provisional_connection(self):
+        c = ConversationImap({'INBOX': {1: self.message('root'), 3: self.message('child', 'root')},
+                              'Sent Items': {2: self.message('child'), 1: self.message('grandchild', 'child')}})
+        first = self.run_scan(c, scan_limit=2)
+        self.assertEqual(len(first['items']), 2); self.assertEqual(first['items'][1]['association'], 'provisional_header_linked_candidate')
+        final = self.run_scan(c, cursor=first['next_cursor'])
+        self.assertEqual(len(final['items']), 2); self.assertEqual(final['items'][1]['association'], 'ambiguous_duplicate_candidate')
+        self.assertEqual(final['edges'], [])
+    def test_partial_folder_fetch_failure_and_sent_discovery_do_not_guess(self):
+        c = ConversationImap({'INBOX': {1: self.message('root')}, 'Sent Items': {1: self.message('reply', 'root')}})
+        c.fetch_failures.add('Sent Items'); result = self.run_scan(c)
+        self.assertEqual(result['status'], 'partial'); self.assertEqual(result['coverage']['folders'][1]['failed_total'], 1)
+        c = ConversationImap({'INBOX': {1: self.message('root')}}); c.list_rows = [b'(\\Sent) "/" Sent', b'(\\Sent) "/" Other']
+        result = self.run_scan(c)
+        self.assertEqual(result['status'], 'partial'); self.assertEqual(len(result['coverage']['folders']), 1)
+        self.assertEqual(result['scope_errors'][0]['folder'], 'SPECIAL-USE \\Sent')
+    def test_uidvalidity_change_quarantines_all_affected_folder_nodes(self):
+        c = ConversationImap({'INBOX': {1: self.message('root')}, 'Sent Items': {1: self.message('reply', 'root')}})
+        def change(c, folder, count):
+            if folder == 'Sent Items' and count == 3: c.validities[folder] = b'99'
+        c.on_search = change
+        with self.assertRaisesRegex(ValueError, 'UIDVALIDITY change'): self.run_scan(c)
+        self.assertEqual(server._CONVERSATION_STATES, {})
+        c = ConversationImap({'INBOX': {1: self.message('root'), 2: self.message('child', 'root')}, 'Sent Items': {}})
+        first = self.run_scan(c, scan_limit=1)
+        c.validities['INBOX'] = b'99'
+        with self.assertRaisesRegex(ValueError, 'UIDVALIDITY change'): self.run_scan(c, cursor=first['next_cursor'])
+        self.assertEqual(server._CONVERSATION_STATES, {})
+    def test_duplicate_parent_cannot_revive_after_other_folder_identity_changes(self):
+        c = ConversationImap({'INBOX': {1: self.message('root'), 2: self.message('child', 'root')}, 'Sent Items': {1: self.message('root')}})
+        first = self.run_scan(c, scan_limit=1)
+        c.validities['Sent Items'] = b'99'
+        with self.assertRaisesRegex(ValueError, 'UIDVALIDITY change'): self.run_scan(c, cursor=first['next_cursor'])
+        self.assertEqual(server._CONVERSATION_STATES, {})
+    def test_extra_anchor_folder_identity_is_revalidated(self):
+        c = ConversationImap({'INBOX': {1: self.message('child', 'root'), 2: self.message('other')}, 'Sent Items': {}, 'Archive': {9: self.message('root')}})
+        with patch.object(server, 'connect', return_value=c):
+            first = server.read_conversation('Archive', ACCOUNT_PREFIX + 'QXJjaGl2ZQ:42:9', scan_limit=1)
+            c.validities['Archive'] = b'99'
+            with self.assertRaisesRegex(ValueError, 'anchor UIDVALIDITY changed'):
+                server.read_conversation('Archive', ACCOUNT_PREFIX + 'QXJjaGl2ZQ:42:9', cursor=first['next_cursor'])
+        self.assertEqual(server._CONVERSATION_STATES, {})
+    def test_bounded_state_and_serialized_data_budget(self):
+        c = ConversationImap({'INBOX': {1: self.message('root'), 2: self.message('child', 'root')}, 'Sent Items': {}})
+        first = self.run_scan(c, scan_limit=1)
+        with patch.object(server, '_CONVERSATION_MAX_STATES', 1):
+            with self.assertRaisesRegex(ValueError, 'Too many active'): self.run_scan(c, scan_limit=1)
+        self.assertEqual(len(server._CONVERSATION_STATES), 1)
+        for state in server._CONVERSATION_STATES.values(): state['expiry_timer'].cancel()
+        server._CONVERSATION_STATES.clear()
+        with patch.object(server, '_CONVERSATION_MAX_BYTES', 500):
+            result = self.run_scan(c)
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['coverage']['folders'][0]['failed_total'], 1)
+
+    def test_concurrent_arrival_and_expunge_never_backfill_window(self):
+        c = ConversationImap({'INBOX': {uid: self.message(str(uid)) for uid in range(1, 5)}, 'Sent Items': {}})
+        first = self.run_scan(c, scan_limit=1)
+        del c.folders['INBOX'][2]; c.folders['INBOX'][5] = self.message('new')
+        final = self.run_scan(c, cursor=first['next_cursor'])
+        coverage = final['coverage']['folders'][0]
+        self.assertTrue(coverage['membership_changed']); self.assertTrue(coverage['new_messages_seen'])
+        self.assertEqual(final['status'], 'partial')
+        self.assertFalse(any('5' in call[2].split(',') for call in c.calls if len(call) > 1 and call[1] == 'FETCH'))
+    def test_mismatched_uid_anchor_is_rejected_and_other_candidate_is_partial(self):
+        c = ConversationImap({'INBOX': {1: self.message('root'), 2: self.message('child', 'root')}, 'Sent Items': {}})
+        c.mismatched_uids.add(('INBOX', 1))
+        with self.assertRaisesRegex(ValueError, 'Anchor header'): self.run_scan(c)
+        c.mismatched_uids = {('INBOX', 2)}
+        result = self.run_scan(c)
+        self.assertEqual(len(result['items']), 1); self.assertEqual(result['status'], 'partial')
+    def test_arbitrary_anchor_folder_reads_only_one_anchor_and_declares_scope(self):
+        c = ConversationImap({'INBOX': {}, 'Sent Items': {2: self.message('reply', 'root')},
+                              'Archive': {9: self.message('root'), 10: self.message('outside', 'root')}})
+        with patch.object(server, 'connect', return_value=c):
+            result = server.read_conversation('Archive', ACCOUNT_PREFIX + 'QXJjaGl2ZQ:42:9')
+        self.assertEqual({item['folder'] for item in result['items']}, {'Archive', 'Sent Items'})
+        self.assertTrue(result['coverage']['anchor']['outside_scanned_windows'])
+        self.assertEqual([entry['folder'] for entry in result['coverage']['folders']], ['INBOX', 'Sent Items'])
+        self.assertEqual([call[2] for call in c.calls if len(call) > 1 and call[:2] == ('Archive', 'FETCH')], ['9'])
+    def test_date_display_order_is_chronological_with_invalid_dates_last(self):
+        c = ConversationImap({'INBOX': {1: self.message('root', extra=b'Date: Mon, 02 Nov 2026 10:00:00 +0800\r\n'),
+                                      2: self.message('missing', 'root'),
+                                      3: self.message('bad-date', 'root', extra=b'Date: invalid\r\n'),
+                                      4: self.message('unknown-zone', 'root', extra=b'Date: Mon, 02 Nov 2026 01:00:00 -0000\r\n')},
+                              'Sent Items': {9: self.message('early', 'root', extra=b'Date: Mon, 02 Nov 2026 01:30:00 +0000\r\n'),
+                                             1: self.message('late', 'root', extra=b'Date: Mon, 02 Nov 2026 04:00:00 +0100\r\n')}})
+        result = self.run_scan(c)
+        self.assertEqual([item['message_id'] for item in result['items'][:3]], ['<early@example.org>', '<root@example.org>', '<late@example.org>'])
+        self.assertTrue(all(item['date_order_status'] == 'missing_invalid_or_timezone_unknown' for item in result['items'][3:]))
+        self.assertEqual([item['id'] for item in result['items'][3:]], sorted(item['id'] for item in result['items'][3:]))
+        self.assertIn('not a verified event timeline', result['reason'])
+    def test_first_page_exception_unregisters_state_and_cancels_expiry(self):
+        c = ConversationImap({'INBOX': {1: self.message('root'), 2: self.message('child', 'root')}, 'Sent Items': {}})
+        timers = []
+        original_timer = server.threading.Timer
+        def timer(*args, **kwargs):
+            value = original_timer(*args, **kwargs); timers.append(value); return value
+        with patch.object(server.threading, 'Timer', side_effect=timer), patch.object(server, '_conversation_result', side_effect=RuntimeError('synthetic output failure')):
+            with self.assertRaisesRegex(RuntimeError, 'synthetic output failure'): self.run_scan(c, scan_limit=1)
+        self.assertEqual(server._CONVERSATION_STATES, {}); self.assertTrue(timers[0].finished.is_set())
+    def test_resumed_page_exception_discards_mutated_state_and_old_cursor(self):
+        c = ConversationImap({'INBOX': {1: self.message('root'), 2: self.message('child', 'root'), 3: self.message('third', 'child')}, 'Sent Items': {}})
+        first = self.run_scan(c, scan_limit=1); state = next(iter(server._CONVERSATION_STATES.values()))
+        with patch.object(server, '_conversation_result', side_effect=RuntimeError('synthetic output failure')):
+            with self.assertRaisesRegex(ValueError, 'discard prior pages and restart'): self.run_scan(c, scan_limit=1, cursor=first['next_cursor'])
+        self.assertEqual(state['nodes'], {}); self.assertEqual(server._CONVERSATION_STATES, {})
+        self.assertTrue(state['expiry_timer'].finished.is_set())
+        with self.assertRaisesRegex(ValueError, 'expired'): self.run_scan(c, cursor=first['next_cursor'])
+
+    def test_memory_budget_oversized_headers_and_expiry_cleanup_are_explicit(self):
+        c = ConversationImap({'INBOX': {1: self.message('root'), 2: self.message('child', extra=b'Subject: ' + b'x' * 17000 + b'\r\n')}, 'Sent Items': {}})
+        result = self.run_scan(c)
+        self.assertEqual(result['status'], 'partial'); self.assertEqual(result['coverage']['folders'][0]['failed_total'], 1)
+        c = ConversationImap({'INBOX': {1: self.message('root'), 2: self.message('child', 'root')}, 'Sent Items': {}})
+        first = self.run_scan(c, scan_limit=1); state = next(iter(server._CONVERSATION_STATES.values()))
+        with patch.object(server.time, 'monotonic', return_value=state['expires'] + 1): server._conversation_expire(state['token'])
+        self.assertEqual(server._CONVERSATION_STATES, {})
+        state['expiry_timer'].cancel()
+
+
 class TestMail(unittest.TestCase):
     def test_draft_roundtrip_preserves_server_added_top_level_received_values_and_order(self):
         c = FakeImap(); saved = []; smtp = FakeSmtp()
