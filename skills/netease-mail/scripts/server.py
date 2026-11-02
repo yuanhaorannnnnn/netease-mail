@@ -1027,21 +1027,40 @@ def read_email_flags(folder: str, message_id: str) -> dict:
 
 @mcp.tool(annotations=DESTRUCTIVE)
 def update_flags(folder: str, message_id: str, flag: Literal['seen', 'flagged'], enabled: bool) -> dict:
-    """Set or clear Seen or Flagged on one IMAP message; changes mailbox state."""
+    """Set or clear only Seen or Flagged after reading its previous state. Already-satisfied requests do not STORE. previous_enabled is a non-atomic observation, not an undo guarantee: concurrent clients may change state. To restore an earlier value, obtain user authorization, read_email_flags again and explicitly set this single flag; never replace all flags or retry automatically after unknown outcomes."""
     if flag not in ('seen', 'flagged'): raise ValueError('Unsupported flag.')
+    if not isinstance(enabled, bool): raise ValueError('enabled must be a boolean.')
     client = connect()
     try:
         uid = _uid(message_id, folder, select(client, folder, readonly=False), client)
+        previous_flags = _fetch_flags(client, uid)
+        previous_enabled = '\\' + flag in {value.lower() for value in previous_flags}
+        result = {'id': message_id, 'folder': folder, 'flag': flag, 'enabled': enabled,
+                  'previous_enabled': previous_enabled,
+                  'state_note': 'The previous and verified states are observations, not atomic guarantees. Concurrent clients can change this flag; read current state and obtain authorization before restoring the earlier value.'}
+        if previous_enabled == enabled:
+            return {**result, 'status': 'unchanged', 'actual_enabled': previous_enabled,
+                    'flags': previous_flags, 'store_attempted': False}
         try:
-            _ok(client.uid('STORE', uid, '+FLAGS.SILENT' if enabled else '-FLAGS.SILENT', '(\\Seen)' if flag == 'seen' else '(\\Flagged)'), 'flag update')
-            data = _ok(client.uid('FETCH', uid, '(UID FLAGS)'), 'flag verification')
-            lines = b' '.join(x if isinstance(x, bytes) else x[0] for x in data if x)
-            match = re.search(rb'\bUID\s+' + uid.encode() + rb'\b.*?FLAGS\s*\(([^)]*)\)|FLAGS\s*\(([^)]*)\).*?\bUID\s+' + uid.encode() + rb'\b', lines, re.I)
-            actual = bool(match and re.search(rb'(?i)(?:^|\s)\\' + flag.encode() + rb'(?:\s|$)', match.group(1) or match.group(2) or b''))
-            verified = bool(match) and actual == enabled
-            return {'status': 'updated' if verified else 'unconfirmed', 'id': message_id, 'flag': flag, 'enabled': enabled}
+            status, _ = client.uid('STORE', uid, '+FLAGS.SILENT' if enabled else '-FLAGS.SILENT', '(\\Seen)' if flag == 'seen' else '(\\Flagged)')
         except Exception:
-            return {'status': 'uncertain', 'id': message_id, 'note': 'Flag state may have changed; read it back before retrying.'}
+            return {**result, 'status': 'uncertain', 'store_attempted': True,
+                    'note': 'Flag state may have changed; read_email_flags before any further write. Do not retry automatically.'}
+        if status != 'OK':
+            # A non-OK response does not establish the current mailbox state.
+            return {**result, 'status': 'unconfirmed', 'store_attempted': True,
+                    'note': 'Server did not acknowledge flag update; read_email_flags to establish current state before any further write.'}
+        try:
+            flags = _fetch_flags(client, uid)
+        except Exception:
+            return {**result, 'status': 'unconfirmed', 'store_attempted': True,
+                    'note': 'Server accepted STORE but flag readback failed; read_email_flags before any further write. Do not retry automatically.'}
+        actual_enabled = '\\' + flag in {value.lower() for value in flags}
+        result.update(actual_enabled=actual_enabled, flags=flags, store_attempted=True)
+        if actual_enabled != enabled:
+            return {**result, 'status': 'unconfirmed',
+                    'note': 'Observed flag differs from the request; read_email_flags before any further write. Do not retry automatically.'}
+        return {**result, 'status': 'updated'}
     finally: _logout(client)
 
 

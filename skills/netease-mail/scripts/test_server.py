@@ -1429,11 +1429,108 @@ class TestMail(unittest.TestCase):
                 server.send_draft('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1')
             send.assert_not_called()
 
-    def test_flag_store_ok_without_matching_uid_is_unconfirmed(self):
+    def test_flag_update_reads_before_and_after_and_preserves_unrelated_flags(self):
+        for flag, enabled, previous, current, command in [
+                ('seen', True, b'1 (UID 1 FLAGS (\\Flagged $Junk))', b'1 (FLAGS (\\Seen \\Flagged $Junk) UID 1)', '+FLAGS.SILENT'),
+                ('flagged', False, b'1 (UID 1 FLAGS (\\Seen \\Flagged))', b'1 (UID 1 FLAGS (\\Seen))', '-FLAGS.SILENT')]:
+            with self.subTest(flag=flag):
+                c = FakeImap(); replies = iter([('OK', [previous]), ('OK', [b'']), ('OK', [current])])
+                def uid(*args): c.calls.append(args); return next(replies)
+                c.uid = uid
+                with patch.object(server, 'connect', return_value=c):
+                    result = server.update_flags('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1', flag, enabled)
+                self.assertEqual(result['status'], 'updated')
+                self.assertEqual(result['previous_enabled'], not enabled)
+                self.assertEqual(result['actual_enabled'], enabled)
+                self.assertTrue(result['store_attempted'])
+                self.assertIn('not atomic', result['state_note'])
+                self.assertEqual(c.calls, [('select', b'"INBOX"', False), ('FETCH', '1', '(UID FLAGS)'),
+                                          ('STORE', '1', command, '(\\Seen)' if flag == 'seen' else '(\\Flagged)'),
+                                          ('FETCH', '1', '(UID FLAGS)')])
+
+    def test_flag_update_uses_real_imaplib_wire_parser_without_full_flag_replacement(self):
+        c = WireImap(b'* 1 FETCH (UID 1 FLAGS (\\Flagged))\r\nT1 OK initial flags\r\n'
+                     b'T2 OK flag stored\r\n'
+                     b'* 1 FETCH (FLAGS (\\Seen \\Flagged) UID 1)\r\nT3 OK verified flags\r\n')
+        with patch.object(server, 'connect', return_value=c), patch.object(server, 'select', return_value='42') as select:
+            result = server.update_flags('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1', 'seen', True)
+        self.assertEqual(result['status'], 'updated')
+        self.assertEqual(result['flags'], ['\\Seen', '\\Flagged'])
+        select.assert_called_once_with(c, 'INBOX', readonly=False)
+        self.assertEqual(c.sent[1:], [b'T1 UID FETCH 1 (UID FLAGS)\r\n',
+                                    b'T2 UID STORE 1 +FLAGS.SILENT (\\Seen)\r\n',
+                                    b'T3 UID FETCH 1 (UID FLAGS)\r\n'])
+
+    def test_flag_update_already_satisfied_does_not_store(self):
+        for flag, enabled, flags in [('seen', True, b'\\Seen \\Flagged'), ('flagged', False, b'\\Seen')]:
+            c = FakeImap()
+            def uid(*args): c.calls.append(args); return 'OK', [b'1 (UID 1 FLAGS (' + flags + b'))']
+            c.uid = uid
+            with patch.object(server, 'connect', return_value=c):
+                result = server.update_flags('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1', flag, enabled)
+            self.assertEqual(result['status'], 'unchanged')
+            self.assertEqual(result['previous_enabled'], enabled)
+            self.assertFalse(result['store_attempted'])
+            self.assertEqual(c.calls, [('select', b'"INBOX"', False), ('FETCH', '1', '(UID FLAGS)')])
+
+    def test_flag_update_requires_known_previous_state_before_store(self):
         c = FakeImap()
+        with patch.object(server, 'connect', return_value=c):
+            with self.assertRaisesRegex(ValueError, 'flags are unknown'):
+                server.update_flags('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1', 'seen', True)
+        self.assertFalse(any(call[0] == 'STORE' for call in c.calls))
+
+    def test_flag_update_readback_never_joins_uid_and_flags_across_messages(self):
+        for current in [[b'1 (UID 1)', b'2 (UID 2 FLAGS (\\Seen))'],
+                        [b'1 (UID 1 FLAGS (\\Seen))', b'1 (UID 1 FLAGS ())'],
+                        [b'2 (UID 2 FLAGS (\\Seen))'], [b'1 (UID 1 FLAGS (\xff))']]:
+            with self.subTest(current=current):
+                c = FakeImap(); replies = iter([('OK', [b'1 (UID 1 FLAGS ())']), ('OK', [b'']), ('OK', current)])
+                def uid(*args): c.calls.append(args); return next(replies)
+                c.uid = uid
+                with patch.object(server, 'connect', return_value=c):
+                    result = server.update_flags('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1', 'seen', True)
+                self.assertEqual(result['status'], 'unconfirmed')
+                self.assertNotIn('actual_enabled', result)
+                self.assertEqual(sum(call[0] == 'STORE' for call in c.calls), 1)
+
+    def test_flag_update_concurrent_state_mismatch_is_observed_without_retry(self):
+        c = FakeImap(); replies = iter([('OK', [b'1 (UID 1 FLAGS ())']), ('OK', [b'']), ('OK', [b'1 (UID 1 FLAGS (\\Flagged))'])])
+        def uid(*args): c.calls.append(args); return next(replies)
+        c.uid = uid
         with patch.object(server, 'connect', return_value=c):
             result = server.update_flags('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1', 'seen', True)
         self.assertEqual(result['status'], 'unconfirmed')
+        self.assertFalse(result['actual_enabled'])
+        self.assertEqual(result['flags'], ['\\Flagged'])
+        self.assertIn('read_email_flags', result['note'])
+        self.assertIn('Do not retry automatically', result['note'])
+        self.assertEqual(sum(call[0] == 'STORE' for call in c.calls), 1)
+
+    def test_flag_update_store_failure_is_not_retried_or_claimed_updated(self):
+        for outcome, expected in [('NO', 'unconfirmed'), ('BAD', 'unconfirmed'), (TimeoutError, 'uncertain')]:
+            with self.subTest(outcome=outcome):
+                c = FakeImap()
+                def uid(*args):
+                    c.calls.append(args)
+                    if args[0] == 'FETCH': return 'OK', [b'1 (UID 1 FLAGS ())']
+                    if outcome is TimeoutError: raise TimeoutError()
+                    return outcome, [b'offline simulated refusal']
+                c.uid = uid
+                with patch.object(server, 'connect', return_value=c):
+                    result = server.update_flags('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1', 'seen', True)
+                self.assertEqual(result['status'], expected)
+                self.assertFalse(result['previous_enabled'])
+                self.assertNotIn('actual_enabled', result)
+                self.assertEqual(sum(call[0] == 'STORE' for call in c.calls), 1)
+                self.assertEqual(sum(call[0] == 'FETCH' for call in c.calls), 1)
+
+    def test_flag_update_rejects_invalid_inputs_before_connect(self):
+        with patch.object(server, 'connect') as connect:
+            for flag, enabled in [('deleted', True), ('seen', 'false'), ('seen', 0)]:
+                with self.subTest(flag=flag, enabled=enabled), self.assertRaises(ValueError):
+                    server.update_flags('INBOX', ACCOUNT_PREFIX + 'SU5CT1g:42:1', flag, enabled)
+            connect.assert_not_called()
 
     def test_draft_append_timeout_and_logout_do_not_mask_result(self):
         c = FakeImap()
