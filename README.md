@@ -4,7 +4,7 @@
 
 让 Codex 通过本机 IMAP/SMTP 处理网易 `163.com`、`126.com`、`yeah.net` 个人邮箱：搜索、读信、附件、草稿、发信、回复、转发和已读/星标。采用 bundled Skill + 本地 stdio MCP，不适用于 Gmail 或企业邮箱。
 
-**0.1.1 测试版。移动邮件暂不可用。** 实测网易账号不支持原生 MOVE，危险的移动降级已禁用；不提供删除或清空垃圾箱。现有单账号真实邮箱验证不能保证所有账号、系统或客户端兼容。
+**0.1.2 测试版。移动邮件暂不可用。** 实测网易账号不支持原生 MOVE，危险的移动降级已禁用；不提供删除或清空垃圾箱。现有单账号真实邮箱验证不能保证所有账号、系统或客户端兼容。
 
 ## 能力与限制
 
@@ -32,7 +32,7 @@ cd netease-mail
 sh scripts/install-runtime.sh
 ```
 
-脚本将 `mcp==1.26.0`、`keyring==25.7.0` 安装到 `${XDG_DATA_HOME:-$HOME/.local/share}/netease-mail/venv`；传递依赖未全量锁定。运行环境与插件源码/cache 分离，插件被复制后无需携带开发 `.venv`。安装与 MCP 宿主必须使用同一用户和相同的 `XDG_DATA_HOME` 设置。pip 成功不代表系统密钥库可用。
+脚本将 `mcp==1.26.0`、`keyring==25.7.0` 安装到用户数据目录下的候选环境，验证通过后切换 `current`；旧版 `venv` 保留并可兼容。传递依赖未全量锁定。运行环境与插件源码/cache 分离，插件被复制后无需携带开发 `.venv`。安装与 MCP 宿主必须使用同一用户和相同的 `XDG_DATA_HOME` 设置。pip 成功不代表系统密钥库可用。已有运行目录可正常使用时不会被改权限或重新安装；需要重建时，若专用目录可被其他用户写入，安装器会拒绝并提示收紧该目录权限，不递归修改内容。
 
 ### 连接 Codex CLI
 
@@ -55,22 +55,21 @@ ln -s "$PWD/skills/netease-mail" "$HOME/.agents/skills/netease-mail"
 
 根 `plugin.json` 和 `mcp.json` 采用 portable Agent Plugins 格式。MCP 入口为 `sh ${PLUGIN_ROOT}/scripts/run-server.sh`，由宿主展开包根目录。通过支持本地插件的 repo/personal marketplace 安装时，仍需先显式运行上述依赖安装脚本，再新开会话。
 
-本仓库尚未完成实际 Codex marketplace/cache 安装验收，也未上架 OpenAI 公共插件目录。公开 GitHub 仓库、marketplace 安装和公共目录发布是三个不同步骤。参见 [官方插件包装文档](https://developers.openai.com/plugins/build/plugins)；local MCP 的公共目录提交资格见 [desktop-only 插件文档](https://developers.openai.com/plugins/deploy/desktop-only)。
+已在隔离容器中验证 Codex marketplace 安装与版本更新、缓存副本的 MCP 启动；个人 marketplace 迁移尚未验证，也未上架 OpenAI 公共插件目录。公开 GitHub 仓库、marketplace 安装和公共目录发布是三个不同步骤。参见 [官方插件包装文档](https://developers.openai.com/plugins/build/plugins)；local MCP 的公共目录提交资格见 [desktop-only 插件文档](https://developers.openai.com/plugins/deploy/desktop-only)。
 
 ## 配置账号
 
 先在网易邮箱设置中开启客户端 IMAP/SMTP，取得专用客户端授权码。用户亲自在私密本机终端运行：
 
 ```sh
-"${XDG_DATA_HOME:-$HOME/.local/share}/netease-mail/venv/bin/python" \
-  skills/netease-mail/scripts/configure.py
+sh scripts/run-python.sh skills/netease-mail/scripts/configure.py
 ```
 
 脚本交互输入邮箱地址和客户端授权码，拒绝管道输入。不要把授权码发送给 agent、写入聊天、命令行参数、仓库或日志；不要使用网页登录密码。
 
 - 邮箱地址保存在 `~/.config/netease-mail/account.json`，该文件不存授权码。
 - 授权码通过 `keyring` 写入系统密钥库，服务名 `codex-netease-mail`；只接受已识别的系统密钥库 backend，拒绝 null、明文、chain 和未知类型。请仅启动一个配置进程；已有不同授权码不会自动覆盖。
-- MCP 需运行在同一用户及能访问密钥库的会话中。无头或锁定会话可能不可用。
+- MCP 需运行在同一用户及能访问密钥库的会话中。Linux 启动器可在缺少 D-Bus 地址时发现当前用户所属的安全 session socket；显式地址保持不变。无头或锁定会话仍可能不可用。
 - `NETEASE_EMAIL` 可覆盖账号地址；对应授权码仍须存在于密钥库。账号切换后重新搜索邮件 ID。
 
 配置成功仅说明本地保存成功。网络使用默认 TLS 验证，IMAP SSL 993、SMTP SSL 465，目标主机固定由支持的网易域名映射。
@@ -89,7 +88,7 @@ ln -s "$PWD/skills/netease-mail" "$HOME/.agents/skills/netease-mail"
 
 发送、回复、转发必须有明确发送指令；查询、预览、安装和配置都不构成发送授权。写入标记或修改草稿也须有相应要求。SMTP 接受只表示服务器接受，不证明对方收到；结果未知时先核实，不能自动重发。草稿发送后仍保留，避免重复发送。
 
-更新代码不会自动替换已有 MCP 进程。只重新加载自己使用的连接，不结束其他会话的服务；启动时磁盘 hash 也不是运行字节的严格证明。
+使用 `sh scripts/doctor.sh` 检查依赖和系统密钥库类型，不读取凭据或连接邮箱；其成功不代表邮箱认证已验证。依赖安装失败不会切换到不完整的新环境；已有旧环境不会被删除。更新代码不会自动替换已有 MCP 进程。只重新加载自己使用的连接，不结束其他会话的服务；启动时磁盘 hash 也不是运行字节的严格证明。
 
 ## 隐私与安全边界
 
@@ -101,15 +100,13 @@ ln -s "$PWD/skills/netease-mail" "$HOME/.agents/skills/netease-mail"
 
 ## 验证范围
 
-2026-11-02：Linux/Python 3.11.7 干净 venv 安装通过，95 项离线回归通过；排除开发 `.venv` 后复制包到临时目录，stdio initialize、17 个工具发现、源码 hash 核对及隔离 HOME 的未配置账号拒绝通过。此次包装测试未访问真实邮箱，未验证实际 Codex 安装缓存或目标桌面密钥库。依赖存在 `pydantic_settings` 的 lifespan forward-reference warning，未阻断测试。
+2026-11-02：Linux/Python 3.11.7 干净 venv 安装通过，95 项离线回归通过；排除开发 `.venv` 后复制包到临时目录，stdio initialize、17 个工具发现、源码 hash 核对及隔离 HOME 的未配置账号拒绝通过。包装测试未访问真实邮箱。已另在隔离容器验证实际 Codex 缓存安装与版本更新；个人 marketplace 迁移尚未验证。依赖存在 `pydantic_settings` 的 lifespan forward-reference warning，未阻断测试。
 
 从仓库根目录运行无凭据测试：
 
 ```sh
-"${XDG_DATA_HOME:-$HOME/.local/share}/netease-mail/venv/bin/python" \
-  -m unittest discover -s skills/netease-mail/scripts -p 'test_*.py'
-"${XDG_DATA_HOME:-$HOME/.local/share}/netease-mail/venv/bin/python" \
-  scripts/smoke_stdio.py
+sh scripts/run-python.sh -m unittest discover -s skills/netease-mail/scripts -p 'test_*.py'
+sh scripts/run-python.sh scripts/smoke_stdio.py
 ```
 
 基线来源及 hash 见 [SOURCE-SNAPSHOT.json](SOURCE-SNAPSHOT.json)，行为细节见 [Skill](skills/netease-mail/SKILL.md)。离线模拟与握手通过不代表所有真实邮箱操作通过；发布检查见 [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md)。
